@@ -1,44 +1,33 @@
 # Claude Slack Agent
 
-A Claude Code skill that gives Claude a persistent two-way Slack channel for communication. When active, Claude posts status updates and receives instructions through a dedicated private `#agent-{username}` channel in your Slack workspace.
+Talk to Claude from Slack. Once installed, Claude gets its own private Slack channel where you can send it instructions, and it sends you updates -- all without leaving Slack.
 
-## Requirements
+## How to install
 
-- Slack credentials at `~/.config/slack-skill/credentials.json` (obtained via the [slack skill](https://github.com/anthropics/claude-code-skills) auth flow)
-- macOS (uses `caffeinate` to prevent sleep)
-- Python 3
+Open Claude Code and paste this:
 
-## Installation
-
-Copy this skill into your Claude Code skills directory, then say "set up slack agent" in Claude Code. Claude will walk you through the rest.
-
-```bash
-# Option A: copy
-cp -r ~/Development/claude-slack-agent ~/.claude/skills/slack-agent
-
-# Option B: via git
-git clone <repo-url> ~/.claude/skills/slack-agent
+```
+curl -sL https://raw.githubusercontent.com/aaronstressfree/claude-slack-agent/main/install.sh | bash
 ```
 
-Then in Claude Code, just say:
+That's it. One line. Done.
 
-> set up slack agent
+## What happens next
 
-Claude will guide you through a conversational setup -- checking credentials, picking a channel name, creating the channel, and configuring everything.
+After the install finishes, type **"set up slack agent"** in Claude Code.
 
-## Usage
+Claude will walk you through everything:
+- Connecting to your Slack workspace
+- Creating a private channel for you
+- Making sure everything works
 
-- **"start slack agent"** -- Creates a thread in your agent channel and begins listening for messages
-- **"stop slack agent"** -- Ends the session and stops listening
-- Reply in the Slack thread to send instructions to Claude
-- Claude shows :loading: when processing and a robot emoji on replies
+No config files to edit. No terminal wizardry. Just a conversation.
 
-## Config
+## How to use
 
-View current config:
+| Say this in Claude Code | What it does |
+|---|---|
+| **start slack agent** | Connects Claude to your Slack channel |
+| **stop slack agent** | Disconnects until next time |
 
-```bash
-python3 scripts/config.py show
-```
-
-Config is stored at `~/.config/claude-slack-agent/config.json` and contains your user ID, channel ID, workspace ID, and credentials path. No secrets are stored in the config itself.
+Once started, just reply in your Slack thread to talk to Claude.
