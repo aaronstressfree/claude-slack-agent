@@ -25,6 +25,10 @@ When the user says **"set up slack agent"**, **"install slack agent"**, or **"co
 2. Follow the conversational onboarding flow described there step by step
 3. Walk the user through credential checks, channel naming, and configuration
 
+## Thread Naming
+
+When starting a session, use a descriptive title based on what the session is doing -- e.g. 'Building reporting dashboard', 'Debugging CI failures'. NOT generic titles like 'Claude Code session'.
+
 ## Quick Start
 
 **"start slack agent"** / **"turn on slack"**:

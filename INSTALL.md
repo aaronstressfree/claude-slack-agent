@@ -16,7 +16,21 @@ Say to the user:
 >
 > The whole thing takes about a minute. Let's go!
 
-## Step 2: Check for Slack credentials
+## Step 2: Check for Block Slack skills
+
+Check if the Block Slack skills are installed by looking for credentials:
+
+```bash
+test -f ~/.config/slack-skill/credentials.json && echo "installed" || echo "missing"
+```
+
+- If the file exists, continue to Step 3.
+- If the file is missing, say:
+  > You'll need to install the Block Slack skills first. Run `sq agents skills add slack` in your terminal, then come back and say **"set up slack agent"** again.
+
+  Then stop here.
+
+## Step 3: Check for Slack credentials
 
 Check if `~/.config/slack-skill/credentials.json` exists:
 
@@ -36,7 +50,7 @@ cat ~/.config/slack-skill/credentials.json 2>/dev/null | python3 -c "import sys,
 
   Then stop here.
 
-## Step 3: Figure out who you are on Slack
+## Step 4: Figure out who you are on Slack
 
 Run the detect command to get the user's Slack identity:
 
@@ -46,7 +60,7 @@ python3 ~/.claude/skills/slack-agent/scripts/config.py detect
 
 Tell the user what you found in plain language, like: "Looks like you're **@aaron** on the **Acme** workspace."
 
-## Step 4: Pick a channel name
+## Step 5: Pick a channel name
 
 Ask the user:
 
@@ -54,7 +68,7 @@ Ask the user:
 
 Wait for their response. Use their choice, or the default if they say something like "sounds good" or "that works".
 
-## Step 5: Ask about channel visibility
+## Step 6: Ask about channel visibility
 
 Ask the user:
 
@@ -62,16 +76,16 @@ Ask the user:
 
 Wait for their response. Default to private if they seem unsure.
 
-## Step 6: Create or reuse a channel
+## Step 7: Create or reuse a channel
 
 Ask the user:
 
 > Want me to **create** a new channel, or do you already have one you'd like to use?
 
-- If they want to create: proceed to Step 7.
+- If they want to create: proceed to Step 8.
 - If they have an existing channel: ask for the channel name, then run setup with that name so it finds the existing channel.
 
-## Step 7: Run setup
+## Step 8: Run setup
 
 Run the setup command with their choices. For example, for a private channel named "agent-aaron":
 
@@ -87,7 +101,7 @@ python3 ~/.claude/skills/slack-agent/scripts/config.py setup --channel agent-aar
 
 If setup succeeds, continue. If it fails, help the user troubleshoot in plain language.
 
-## Step 8: Explain how to use it going forward
+## Step 9: Explain how to use it going forward
 
 This is important. Tell the user clearly:
 
@@ -104,7 +118,7 @@ This is important. Tell the user clearly:
 > - You can run multiple Claude Code sessions at once -- each gets its own thread.
 > - While the agent is running, I'll show a :loading_: spinner when I'm reading your message, and a robot emoji on my replies.
 
-## Step 9: Offer to test it right now
+## Step 10: Offer to test it right now
 
 Ask the user:
 

@@ -15,6 +15,10 @@ You can run multiple Claude Code sessions at the same time -- each one gets its 
 
 While the agent is running, it keeps your Mac awake so polling doesn't get interrupted.
 
+## Prerequisites
+
+You'll need the Block Slack skill installed (`sq agents skills add slack`). The setup will check for this and guide you if it's missing.
+
 ## Install
 
 Open Claude Code and paste this one line:
