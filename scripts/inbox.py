@@ -175,11 +175,29 @@ def get_human_messages(since: str):
 
 
 def get_recent_context(limit: int = 5):
-    """Get the last N messages from the thread (both human and bot) for context."""
+    """Get the last N messages from the thread (both human and bot) for context.
+    Uses latest=true to fetch only the most recent messages, not all of them."""
     thread_ts = load_thread()
     if not thread_ts:
         return []
-    result = fetch_thread_replies("0")
+
+    # Fetch only the latest messages instead of all since "0"
+    token = get_token()
+    params = urllib.parse.urlencode({
+        "channel": CHANNEL,
+        "ts": thread_ts,
+        "limit": str(limit * 3),  # Fetch extra to account for skipped messages
+        "inclusive": "false",
+        "latest": "999999999999.999999",
+    })
+    req = urllib.request.Request(
+        f"https://slack.com/api/conversations.replies?{params}",
+        headers={"Authorization": f"Bearer {token}", "Content-Type": "application/json; charset=utf-8"},
+    )
+    try:
+        result = api_call(req)
+    except Exception:
+        return []  # Gracefully degrade — context is nice-to-have, not critical
     if not result.get("ok"):
         return []
 
@@ -236,15 +254,12 @@ def cmd_reply(message: str):
     )
     result = api_call(req)
 
-    # Advance cursor past all current human messages
-    cursor = load_cursor()
-    _, latest = get_human_messages(cursor)
-    if latest > cursor:
-        save_cursor(latest)
+    # Use the reply's timestamp as cursor — anything before our reply is "seen"
+    if result.get("ok") and result.get("message", {}).get("ts"):
+        save_cursor(result["message"]["ts"])
 
     print(json.dumps({
         "ok": result.get("ok", False),
-        "recent_context": get_recent_context(),
     }, indent=2))
 
 
