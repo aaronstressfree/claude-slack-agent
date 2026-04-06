@@ -4,13 +4,13 @@
 SCRIPTS_DIR="$(cd "$(dirname "$0")" && pwd)"
 
 # Session isolation: use CLAUDE_SESSION_ID if available.
-# If not set, generate a fallback from parent PID to avoid sharing state.
+# If not set, use global state dir (backward compatible).
 SESSION_ID="${CLAUDE_SESSION_ID:-}"
-if [ -z "$SESSION_ID" ]; then
-  SESSION_ID="fallback-$$-$(date +%s)"
-  export CLAUDE_SESSION_ID="$SESSION_ID"
+if [ -n "$SESSION_ID" ]; then
+  STATE_DIR="$HOME/.config/slack-alerts/sessions/$SESSION_ID"
+else
+  STATE_DIR="$HOME/.config/slack-alerts"
 fi
-STATE_DIR="$HOME/.config/slack-alerts/sessions/$SESSION_ID"
 mkdir -p "$STATE_DIR"
 
 # Kill this session's listener by PID file first, fall back to pattern match
@@ -58,8 +58,10 @@ case "$1" in
     [ -z "$TITLE" ] && TITLE="Claude Code session"
 
     # Check if this session already has an active thread — skip re-creating
-    THREAD_FILE="$STATE_DIR/thread_ts"
-    if [ -f "$THREAD_FILE" ] && [ -s "$THREAD_FILE" ]; then
+    # Check both session-scoped and global locations (alert.py may write to either)
+    THREAD_FILE="$STATE_DIR/thread.json"
+    GLOBAL_THREAD="$HOME/.config/slack-alerts/thread.json"
+    if { [ -f "$THREAD_FILE" ] && [ -s "$THREAD_FILE" ]; } || { [ -f "$GLOBAL_THREAD" ] && [ -s "$GLOBAL_THREAD" ]; }; then
       # Session already running — just ensure caffeinate is alive
       if [ -f "$STATE_DIR/caffeinate.pid" ]; then
         CAFF_PID=$(cat "$STATE_DIR/caffeinate.pid")
@@ -104,6 +106,10 @@ case "$1" in
     fi
 
     python3 "$SCRIPTS_DIR/alert.py" end 2>/dev/null
+
+    # Clear thread file so next start creates a fresh session
+    rm -f "$STATE_DIR/thread.json" "$STATE_DIR/session-thread.json"
+
     echo '{"status": "stopped"}'
     ;;
 
