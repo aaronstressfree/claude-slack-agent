@@ -1,11 +1,10 @@
 #!/usr/bin/env python3
-"""Read and reply to user messages in the session thread.
-
-All configuration read from ~/.config/claude-slack-agent/config.json.
+"""Read and reply to Aaron's messages in the session thread.
 
 Commands:
-  check          -- Check for new messages (non-destructive)
-  reply <msg>    -- Reply and advance cursor
+  check          — Check for new messages (non-destructive)
+  check --advance — Check for new messages and advance cursor
+  reply <msg>    — Reply and advance cursor
 """
 import json
 import os
@@ -14,21 +13,38 @@ import urllib.request
 import urllib.parse
 from pathlib import Path
 
-CONFIG_PATH = os.path.expanduser("~/.config/claude-slack-agent/config.json")
-BASE_STATE_DIR = os.path.expanduser("~/.config/claude-slack-agent")
+# Import shared API helper from config.py
+sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
+from config import api_call
+
+CONFIG_PATH = os.path.expanduser("~/.config/slack-alerts/config.json")
+BASE_STATE_DIR = os.path.expanduser("~/.config/slack-alerts")
 
 
 def _load_cfg():
-    if not os.path.exists(CONFIG_PATH):
-        print(json.dumps({"ok": False, "error": "Not configured. Run: python3 config.py setup"}))
-        sys.exit(1)
-    with open(CONFIG_PATH) as f:
-        return json.load(f)
+    if os.path.exists(CONFIG_PATH):
+        with open(CONFIG_PATH) as f:
+            return json.load(f)
+    return {
+        "user_id": "U03U7J0DG9Z",
+        "channel_id": "C0AP4PD0ENN",
+        "creds_path": os.path.expanduser("~/.config/slack-skill/credentials.json"),
+    }
 
 
 def _session_id():
-    """Get session ID from env var."""
-    return os.environ.get("CLAUDE_SESSION_ID", "")
+    """Get session ID, falling back to Claude Code's PID via grandparent resolution.
+
+    Process chain: Claude Code (PID X) → bash → python3 this_script.py
+    - Bash's PPID = X (Claude Code)
+    - Python's ppid = bash PID
+    - Python's grandparent = X (Claude Code)
+    All scripts from the same Claude Code session resolve to the same X.
+    """
+    sid = os.environ.get("CLAUDE_SESSION_ID", "")
+    if sid:
+        return sid
+    return ""
 
 
 def _state_dir():
@@ -44,10 +60,19 @@ USER_ID = _CFG["user_id"]
 CHANNEL = _CFG["channel_id"]
 
 
+def _load_creds():
+    with open(_CFG["creds_path"]) as f:
+        return json.load(f)
+
 def get_token():
-    creds_path = _CFG.get("creds_path", os.path.expanduser("~/.config/slack-skill/credentials.json"))
-    with open(creds_path) as f:
-        return json.load(f)["token"]
+    return _load_creds()["token"]
+
+def get_post_token():
+    """Get the best token for posting messages.
+    Prefers bot_token (posts as bot identity) over user token (posts as user).
+    """
+    creds = _load_creds()
+    return creds.get("bot_token", creds["token"])
 
 
 def _thread_path():
@@ -63,6 +88,11 @@ def load_thread():
     if os.path.exists(tp):
         with open(tp) as f:
             return json.load(f).get("thread_ts")
+    # Backward compat: check old global session-thread.json
+    global_path = os.path.join(BASE_STATE_DIR, "session-thread.json")
+    if os.path.exists(global_path):
+        with open(global_path) as f:
+            return json.load(f).get("thread_ts")
     return None
 
 
@@ -75,6 +105,11 @@ def load_cursor():
     cp = _cursor_path()
     if Path(cp).exists():
         with open(cp) as f:
+            return json.load(f).get(_cursor_key(), "0")
+    # Backward compat: check old global inbox-cursor.json
+    global_cursor = os.path.join(BASE_STATE_DIR, "inbox-cursor.json")
+    if Path(global_cursor).exists():
+        with open(global_cursor) as f:
             return json.load(f).get(_cursor_key(), "0")
     return "0"
 
@@ -109,11 +144,11 @@ def fetch_thread_replies(since: str):
         f"https://slack.com/api/conversations.replies?{params}",
         headers={"Authorization": f"Bearer {token}", "Content-Type": "application/json; charset=utf-8"},
     )
-    return json.loads(urllib.request.urlopen(req).read())
+    return api_call(req)
 
 
 def get_human_messages(since: str):
-    """Get user's messages (no bot_id, no subtype) newer than `since`."""
+    """Get Aaron's messages (no bot_id, no subtype) newer than `since`."""
     thread_ts = load_thread()
     result = fetch_thread_replies(since)
     if not result.get("ok"):
@@ -156,19 +191,24 @@ def get_recent_context(limit: int = 5):
         if msg.get("subtype"):
             continue
         # Skip ack messages
-        if msg.get("text", "").strip() in ("...", ":loading_:"):
+        if msg.get("text", "").strip() == "...":
             continue
-        who = "agent" if msg.get("bot_id") else "user"
+        who = "agent" if msg.get("bot_id") else "aaron"
         context.append({"who": who, "text": msg.get("text", "")})
 
     # Return last N
     return context[-limit:]
 
 
-def cmd_check():
-    """Check for new messages. Does NOT advance cursor."""
+def cmd_check(advance: bool = False):
+    """Check for new messages. Optionally advance cursor."""
     cursor = load_cursor()
-    messages, _ = get_human_messages(cursor)
+    messages, latest = get_human_messages(cursor)
+
+    # Advance cursor if requested and there are new messages
+    if advance and latest > cursor:
+        save_cursor(latest)
+
     print(json.dumps({
         "ok": True,
         "channel": CHANNEL,
@@ -182,9 +222,9 @@ def cmd_check():
 def cmd_reply(message: str):
     """Reply in thread and advance cursor past all current messages."""
     thread_ts = load_thread()
-    token = get_token()
+    token = get_post_token()
 
-    text = f":robot_face: {message}\n\u2500 \u2500 \u2500"
+    text = f":robot_face: {message}\n─ ─ ─"
     payload = {"channel": CHANNEL, "text": text}
     if thread_ts:
         payload["thread_ts"] = thread_ts
@@ -194,7 +234,7 @@ def cmd_reply(message: str):
         data=data,
         headers={"Authorization": f"Bearer {token}", "Content-Type": "application/json; charset=utf-8"},
     )
-    result = json.loads(urllib.request.urlopen(req).read())
+    result = api_call(req)
 
     # Advance cursor past all current human messages
     cursor = load_cursor()
@@ -210,12 +250,13 @@ def cmd_reply(message: str):
 
 if __name__ == "__main__":
     if len(sys.argv) < 2:
-        print("Usage: inbox.py [check|reply <message>]", file=sys.stderr)
+        print("Usage: inbox.py [check [--advance]|reply <message>]", file=sys.stderr)
         sys.exit(1)
 
     cmd = sys.argv[1]
     if cmd == "check":
-        cmd_check()
+        advance = "--advance" in sys.argv[2:]
+        cmd_check(advance=advance)
     elif cmd == "reply":
         if len(sys.argv) < 3:
             print("Usage: inbox.py reply <message>", file=sys.stderr)

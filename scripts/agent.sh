@@ -2,37 +2,68 @@
 # Usage: agent.sh start "description"
 #        agent.sh stop
 SCRIPTS_DIR="$(cd "$(dirname "$0")" && pwd)"
-STATE_DIR="$HOME/.config/claude-slack-agent"
 
-# Session ID: use CLAUDE_SESSION_ID env var
+# Session isolation: use CLAUDE_SESSION_ID if available.
+# If not set, generate a fallback from parent PID to avoid sharing state.
 SESSION_ID="${CLAUDE_SESSION_ID:-}"
-
-# Build a grep pattern to identify THIS session's listener
-if [ -n "$SESSION_ID" ]; then
-  LISTENER_PATTERN="CLAUDE_SESSION_ID=$SESSION_ID.*listener.sh"
-else
-  LISTENER_PATTERN="listener.sh"
+if [ -z "$SESSION_ID" ]; then
+  SESSION_ID="fallback-$$-$(date +%s)"
+  export CLAUDE_SESSION_ID="$SESSION_ID"
 fi
+STATE_DIR="$HOME/.config/slack-alerts/sessions/$SESSION_ID"
+mkdir -p "$STATE_DIR"
+
+# Kill this session's listener by PID file first, fall back to pattern match
+kill_session_listener() {
+  # Prefer PID file (reliable, session-scoped)
+  if [ -f "$STATE_DIR/listener.pid" ]; then
+    local pid
+    pid=$(cat "$STATE_DIR/listener.pid")
+    # Verify PID is still a listener process before killing
+    if [ -n "$pid" ] && kill -0 "$pid" 2>/dev/null; then
+      kill "$pid" 2>/dev/null
+    fi
+    rm -f "$STATE_DIR/listener.pid"
+    return
+  fi
+
+  # Fall back to pattern match — only use session-scoped pattern
+  if [ -n "$SESSION_ID" ]; then
+    pkill -f "CLAUDE_SESSION_ID=$SESSION_ID.*listener.sh" 2>/dev/null
+  fi
+  # If no SESSION_ID and no PID file, don't kill anything — too risky
+}
+
+# Kill a caffeinate process by PID file, with validation
+kill_caffeinate() {
+  local pidfile="$1"
+  if [ -f "$pidfile" ]; then
+    local pid
+    pid=$(cat "$pidfile")
+    if [ -n "$pid" ] && kill -0 "$pid" 2>/dev/null; then
+      # Verify this PID is actually a caffeinate process
+      local pname
+      pname=$(ps -p "$pid" -o comm= 2>/dev/null)
+      if [ "$pname" = "caffeinate" ]; then
+        kill "$pid" 2>/dev/null
+      fi
+    fi
+    rm -f "$pidfile"
+  fi
+}
 
 case "$1" in
   start)
     TITLE="${*:2}"
     [ -z "$TITLE" ] && TITLE="Claude Code session"
 
-    # Check if setup is needed
-    if [ ! -f "$STATE_DIR/config.json" ]; then
-      echo "First-time setup: detecting Slack identity..."
-      python3 "$SCRIPTS_DIR/config.py" setup
-      if [ $? -ne 0 ]; then
-        echo '{"ok": false, "error": "Setup failed. See output above."}'
-        exit 1
-      fi
-    fi
+    # Kill only this session's listener
+    kill_session_listener
 
-    # Kill only this session's listener (or all if no session ID)
-    pkill -f "$LISTENER_PATTERN" 2>/dev/null
+    # Kill any existing caffeinate from previous sessions before spawning new one
+    kill_caffeinate "$STATE_DIR/caffeinate.pid"
 
-    # Keep Mac awake while agent is running
+    # Keep Mac awake — PID stored per-session
     caffeinate -d -i -s &
     echo $! > "$STATE_DIR/caffeinate.pid"
 
@@ -44,12 +75,14 @@ case "$1" in
 
   stop)
     # Kill only this session's listener
-    pkill -f "$LISTENER_PATTERN" 2>/dev/null
+    kill_session_listener
 
-    # Stop caffeinate
-    if [ -f "$STATE_DIR/caffeinate.pid" ]; then
-      kill "$(cat "$STATE_DIR/caffeinate.pid")" 2>/dev/null
-      rm -f "$STATE_DIR/caffeinate.pid"
+    # Stop this session's caffeinate (with process name validation + pkill fallback)
+    kill_caffeinate "$STATE_DIR/caffeinate.pid"
+    # Fallback: kill any orphaned caffeinate started by this script
+    # (only if PID file was missing/stale)
+    if [ ! -f "$STATE_DIR/caffeinate.pid" ]; then
+      pkill -P 1 -x caffeinate 2>/dev/null || true
     fi
 
     python3 "$SCRIPTS_DIR/alert.py" end 2>/dev/null

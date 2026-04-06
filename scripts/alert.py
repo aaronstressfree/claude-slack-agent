@@ -1,37 +1,50 @@
 #!/usr/bin/env python3
-"""Slack agent alerts for Claude Code.
+"""Slack agent for Claude Code → #agent-aaron channel.
 
-Posts messages, acks, alerts, and images to the session thread.
-All configuration read from ~/.config/claude-slack-agent/config.json.
-
-Commands:
-  start <title>          — Create session thread
-  post <msg>             — Post update (robot prefix + divider)
-  alert <msg>            — Post with @mention + push notification
-  ack                    — Post :loading_: typing indicator
-  end                    — Post session ended message
-  image <path> [caption] — Upload image to thread
+Message design:
+- Session header: bold title with robot emoji (parent message)
+- Replies: clean text, no prefix clutter. Bot identity is implicit from bot_id.
+- Ack: just "..." — minimal
+- Alerts: @mention for push notification
 """
 import json
 import os
 import sys
 import urllib.request
 
-CONFIG_PATH = os.path.expanduser("~/.config/claude-slack-agent/config.json")
-BASE_STATE_DIR = os.path.expanduser("~/.config/claude-slack-agent")
+# Import shared API helper from config.py
+sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
+from config import api_call, api_call_raw
+
+CONFIG_PATH = os.path.expanduser("~/.config/slack-alerts/config.json")
+BASE_STATE_DIR = os.path.expanduser("~/.config/slack-alerts")
 
 
 def _load_cfg():
-    if not os.path.exists(CONFIG_PATH):
-        print(json.dumps({"ok": False, "error": "Not configured. Run: python3 config.py setup"}))
-        sys.exit(1)
-    with open(CONFIG_PATH) as f:
-        return json.load(f)
+    if os.path.exists(CONFIG_PATH):
+        with open(CONFIG_PATH) as f:
+            return json.load(f)
+    return {
+        "user_id": "U03U7J0DG9Z",
+        "workspace_id": "T05HJ0CKWG5",
+        "channel_id": "C0AP4PD0ENN",
+        "creds_path": os.path.expanduser("~/.config/slack-skill/credentials.json"),
+    }
 
 
 def _session_id():
-    """Get session ID from env var."""
-    return os.environ.get("CLAUDE_SESSION_ID", "")
+    """Get session ID, falling back to Claude Code's PID via grandparent resolution.
+
+    Process chain: Claude Code (PID X) → bash → python3 this_script.py
+    - Bash's PPID = X (Claude Code)
+    - Python's ppid = bash PID
+    - Python's grandparent = X (Claude Code)
+    All scripts from the same Claude Code session resolve to the same X.
+    """
+    sid = os.environ.get("CLAUDE_SESSION_ID", "")
+    if sid:
+        return sid
+    return ""
 
 
 def _state_dir():
@@ -44,14 +57,23 @@ def _state_dir():
 
 _CFG = _load_cfg()
 USER_ID = _CFG["user_id"]
-TEAM_ID = _CFG.get("workspace_id", "")
+TEAM_ID = _CFG["workspace_id"]
 CHANNEL = _CFG["channel_id"]
 
 
+def _load_creds():
+    with open(_CFG["creds_path"]) as f:
+        return json.load(f)
+
 def get_token():
-    creds_path = _CFG.get("creds_path", os.path.expanduser("~/.config/slack-skill/credentials.json"))
-    with open(creds_path) as f:
-        return json.load(f)["token"]
+    return _load_creds()["token"]
+
+def get_post_token():
+    """Get the best token for posting messages.
+    Prefers bot_token (posts as bot identity) over user token (posts as user).
+    """
+    creds = _load_creds()
+    return creds.get("bot_token", creds["token"])
 
 
 def _thread_path():
@@ -62,6 +84,11 @@ def load_thread():
     tp = _thread_path()
     if os.path.exists(tp):
         with open(tp) as f:
+            return json.load(f).get("thread_ts")
+    # Backward compat: check old global session-thread.json
+    global_path = os.path.join(BASE_STATE_DIR, "session-thread.json")
+    if os.path.exists(global_path):
+        with open(global_path) as f:
             return json.load(f).get("thread_ts")
     return None
 
@@ -74,8 +101,8 @@ def save_thread(thread_ts: str):
 
 
 def post(text: str, thread_ts: str = None):
-    """Post a raw message to the channel."""
-    token = get_token()
+    """Post a raw message to the channel using bot token when available."""
+    token = get_post_token()
     payload = {"channel": CHANNEL, "text": text}
     if thread_ts:
         payload["thread_ts"] = thread_ts
@@ -85,7 +112,7 @@ def post(text: str, thread_ts: str = None):
         data=data,
         headers={"Authorization": f"Bearer {token}", "Content-Type": "application/json; charset=utf-8"},
     )
-    return json.loads(urllib.request.urlopen(req).read())
+    return api_call(req)
 
 
 def cmd_start(title: str):
@@ -104,9 +131,9 @@ def cmd_post(message: str):
     """Post a message in the thread with robot emoji prefix."""
     thread_ts = load_thread()
     if not thread_ts:
-        print(json.dumps({"ok": False, "error": "no session -- run start first"}))
+        print(json.dumps({"ok": False, "error": "no session — run start first"}))
         sys.exit(1)
-    result = post(f":robot_face: {message}\n\u2500 \u2500 \u2500", thread_ts=thread_ts)
+    result = post(f":robot_face: {message}\n─ ─ ─", thread_ts=thread_ts)
     print(json.dumps({"ok": result.get("ok", False)}))
 
 
@@ -120,13 +147,13 @@ def cmd_ack():
 
 def cmd_alert(message: str):
     """Post in thread with @mention + push notification."""
-    token = get_token()
+    token = get_token()  # reminders.add needs user token
     thread_ts = load_thread()
 
     if thread_ts:
-        post(f":robot_face: <@{USER_ID}> {message}\n\u2500 \u2500 \u2500", thread_ts=thread_ts)
+        post(f":robot_face: <@{USER_ID}> {message}\n─ ─ ─", thread_ts=thread_ts)
 
-    # Push notification via reminder
+    # Push notification
     data = json.dumps({
         "text": message,
         "time": "in 1 second",
@@ -138,7 +165,7 @@ def cmd_alert(message: str):
         data=data,
         headers={"Authorization": f"Bearer {token}", "Content-Type": "application/json; charset=utf-8"},
     )
-    result = json.loads(urllib.request.urlopen(req).read())
+    result = api_call(req)
     print(json.dumps({"ok": result.get("ok", False)}))
 
 
@@ -153,9 +180,8 @@ def cmd_end():
 def cmd_image(file_path: str, comment: str = ""):
     """Upload an image to the session thread."""
     import mimetypes
-    import urllib.parse
     thread_ts = load_thread()
-    token = get_token()
+    token = get_post_token()
 
     if not os.path.exists(file_path):
         print(json.dumps({"ok": False, "error": f"file not found: {file_path}"}))
@@ -164,13 +190,14 @@ def cmd_image(file_path: str, comment: str = ""):
     filename = os.path.basename(file_path)
     content_type = mimetypes.guess_type(file_path)[0] or "application/octet-stream"
 
-    # Step 1: Get upload URL
+    # Step 1: Get upload URL (query params, not JSON body)
+    import urllib.parse
     params = urllib.parse.urlencode({"filename": filename, "length": os.path.getsize(file_path)})
     req = urllib.request.Request(
         f"https://slack.com/api/files.getUploadURLExternal?{params}",
         headers={"Authorization": f"Bearer {token}"},
     )
-    result = json.loads(urllib.request.urlopen(req).read())
+    result = api_call(req)
     if not result.get("ok"):
         print(json.dumps({"ok": False, "error": result.get("error")}))
         sys.exit(1)
@@ -183,21 +210,21 @@ def cmd_image(file_path: str, comment: str = ""):
         file_data = f.read()
     req = urllib.request.Request(upload_url, data=file_data, method="POST")
     req.add_header("Content-Type", content_type)
-    urllib.request.urlopen(req)
+    api_call_raw(req)
 
     # Step 3: Complete the upload
     complete_data = json.dumps({
         "files": [{"id": file_id, "title": filename}],
         "channel_id": CHANNEL,
         "thread_ts": thread_ts or "",
-        "initial_comment": f":robot_face: {comment}\n\u2500 \u2500 \u2500" if comment else "",
+        "initial_comment": f":robot_face: {comment}\n─ ─ ─" if comment else "",
     }).encode("utf-8")
     req = urllib.request.Request(
         "https://slack.com/api/files.completeUploadExternal",
         data=complete_data,
         headers={"Authorization": f"Bearer {token}", "Content-Type": "application/json; charset=utf-8"},
     )
-    result = json.loads(urllib.request.urlopen(req).read())
+    result = api_call(req)
     print(json.dumps({"ok": result.get("ok", False), "file_id": file_id}))
 
 
