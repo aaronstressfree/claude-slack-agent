@@ -25,11 +25,9 @@ def _load_cfg():
     if os.path.exists(CONFIG_PATH):
         with open(CONFIG_PATH) as f:
             return json.load(f)
-    return {
-        "user_id": "U03U7J0DG9Z",
-        "channel_id": "C0AP4PD0ENN",
-        "creds_path": os.path.expanduser("~/.config/slack-skill/credentials.json"),
-    }
+    raise FileNotFoundError(
+        f"Config not found at {CONFIG_PATH}. Run setup-bot-token.py first."
+    )
 
 
 def _session_id():
