@@ -57,6 +57,24 @@ case "$1" in
     TITLE="${*:2}"
     [ -z "$TITLE" ] && TITLE="Claude Code session"
 
+    # Check if this session already has an active thread — skip re-creating
+    THREAD_FILE="$STATE_DIR/thread_ts"
+    if [ -f "$THREAD_FILE" ] && [ -s "$THREAD_FILE" ]; then
+      # Session already running — just ensure caffeinate is alive
+      if [ -f "$STATE_DIR/caffeinate.pid" ]; then
+        CAFF_PID=$(cat "$STATE_DIR/caffeinate.pid")
+        if ! kill -0 "$CAFF_PID" 2>/dev/null; then
+          caffeinate -d -i -s &
+          echo $! > "$STATE_DIR/caffeinate.pid"
+        fi
+      else
+        caffeinate -d -i -s &
+        echo $! > "$STATE_DIR/caffeinate.pid"
+      fi
+      echo '{"status": "already_running"}'
+      exit 0
+    fi
+
     # Kill only this session's listener
     kill_session_listener
 
