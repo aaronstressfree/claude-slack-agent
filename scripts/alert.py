@@ -77,24 +77,58 @@ def _thread_path():
     return os.path.join(_state_dir(), "thread.json")
 
 
-def load_thread():
+def _load_thread_data():
+    """Load thread.json data dict, checking session-scoped then global paths."""
     tp = _thread_path()
     if os.path.exists(tp):
         with open(tp) as f:
-            return json.load(f).get("thread_ts")
+            return json.load(f)
     # Backward compat: check old global session-thread.json
     global_path = os.path.join(BASE_STATE_DIR, "session-thread.json")
     if os.path.exists(global_path):
         with open(global_path) as f:
-            return json.load(f).get("thread_ts")
+            return json.load(f)
     return None
+
+
+def load_thread():
+    data = _load_thread_data()
+    return data.get("thread_ts") if data else None
+
+
+def _is_thread_owner():
+    """Check if the current session owns the active thread.
+
+    Returns True if:
+    - This session created the thread (owner_session matches)
+    - The thread.json lives in this session's scoped dir (not global fallback)
+    Returns False if:
+    - No thread exists
+    - The thread has no owner and caller has no session ID (ambiguous)
+    - The owner doesn't match
+    """
+    data = _load_thread_data()
+    if not data:
+        return False
+    owner = data.get("owner_session")
+    sid = _session_id()
+    if not owner:
+        # Legacy thread without ownership — only allow if caller also has
+        # no session ID (same ambiguous scope). Prevents random sessions
+        # from hijacking an ownerless thread.
+        return not sid or sid == ""
+    return owner == sid
 
 
 def save_thread(thread_ts: str):
     state = _state_dir()
     os.makedirs(state, exist_ok=True)
     with open(_thread_path(), "w") as f:
-        json.dump({"thread_ts": thread_ts, "channel": CHANNEL}, f)
+        json.dump({
+            "thread_ts": thread_ts,
+            "channel": CHANNEL,
+            "owner_session": _session_id(),
+        }, f)
 
 
 def post(text: str, thread_ts: str = None):
@@ -130,6 +164,10 @@ def cmd_post(message: str):
     if not thread_ts:
         print(json.dumps({"ok": False, "error": "no session — run start first"}))
         sys.exit(1)
+    if not _is_thread_owner():
+        # Silent no-op: this session didn't start the thread
+        print(json.dumps({"ok": True, "skipped": "not thread owner"}))
+        return
     result = post(f":robot_face: {message}\n─ ─ ─", thread_ts=thread_ts)
     print(json.dumps({"ok": result.get("ok", False)}))
 
@@ -137,7 +175,7 @@ def cmd_post(message: str):
 def cmd_ack():
     """Typing indicator."""
     thread_ts = load_thread()
-    if thread_ts:
+    if thread_ts and _is_thread_owner():
         post(":loading_:", thread_ts=thread_ts)
     print(json.dumps({"ok": True}))
 
@@ -147,7 +185,7 @@ def cmd_alert(message: str):
     token = get_token()  # reminders.add needs user token
     thread_ts = load_thread()
 
-    if thread_ts:
+    if thread_ts and _is_thread_owner():
         post(f":robot_face: <@{USER_ID}> {message}\n─ ─ ─", thread_ts=thread_ts)
 
     # Push notification
@@ -179,6 +217,10 @@ def cmd_image(file_path: str, comment: str = ""):
     import mimetypes
     thread_ts = load_thread()
     token = get_post_token()
+
+    if not _is_thread_owner():
+        print(json.dumps({"ok": True, "skipped": "not thread owner"}))
+        return
 
     if not os.path.exists(file_path):
         print(json.dumps({"ok": False, "error": f"file not found: {file_path}"}))
