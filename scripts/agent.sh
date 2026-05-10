@@ -90,6 +90,14 @@ case "$1" in
     python3 "$SCRIPTS_DIR/alert.py" start "$TITLE"
     python3 "$SCRIPTS_DIR/alert.py" post "Ready. Reply here to send instructions."
 
+    # Auto-spawn listener so callers don't have to remember the second command.
+    # listener.sh has its own dedup (or the pkill above already cleared stale
+    # ones), so a duplicate spawn is harmless.
+    LOGFILE="$STATE_DIR/listener.log"
+    mkdir -p "$STATE_DIR"
+    nohup bash "$SCRIPTS_DIR/listener.sh" >> "$LOGFILE" 2>&1 < /dev/null &
+    disown 2>/dev/null || true
+
     echo '{"status": "started"}'
     ;;
 

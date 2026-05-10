@@ -50,3 +50,32 @@ No config files to edit. No environment variables. Just a conversation.
 That's the whole interface. Two phrases.
 
 **Important:** The agent does not auto-start. Every time you open Claude Code and want Slack access, say "start slack agent". When you're done, say "stop slack agent" -- it keeps things clean and lets Claude know you're finished.
+
+## Listener auto-respawn
+
+The most common way Claude goes silent in long Slack sessions is forgetting to restart `listener.sh` after replying. Two layers prevent that now:
+
+1. **Auto-respawn on reply.** `python3 scripts/inbox.py reply "..."` spawns a fresh background `listener.sh` as part of the reply, so a new listener is always waiting for the next message. The response JSON includes `listener_respawned: true`. Pass `--no-respawn` if you're shutting down.
+2. **Auto-spawn on start.** `bash scripts/agent.sh start` now spawns the listener for you. You no longer need a separate `bash scripts/listener.sh` call right after start (though it stays safe as a no-op).
+
+## Optional: UserPromptSubmit safety net
+
+For a belt-and-suspenders guard against missed messages, register `scripts/check-unread-hook.sh` as a UserPromptSubmit hook in `~/.claude/settings.json`:
+
+```json
+"hooks": {
+  "UserPromptSubmit": [
+    {
+      "hooks": [
+        {
+          "type": "command",
+          "command": "bash ~/.claude/skills/claude-slack-agent/scripts/check-unread-hook.sh",
+          "timeout": 5
+        }
+      ]
+    }
+  ]
+}
+```
+
+(Adjust the path to your install location.) On every user prompt, the hook checks for unread Slack messages in the current Claude session's thread. If there are unread messages, it surfaces a warning to Claude before the turn runs so Claude reads and replies before doing anything else. The hook is silent when no Slack session is active and times out gracefully if Slack is slow.

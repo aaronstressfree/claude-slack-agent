@@ -34,7 +34,8 @@ When starting a session, use a descriptive title based on what the session is do
 **"start slack agent"** / **"turn on slack"**:
 ```bash
 bash scripts/agent.sh start "Brief description"
-bash scripts/listener.sh  # run_in_background: true
+# listener auto-spawns inside agent.sh start; explicit call below is optional
+bash scripts/listener.sh  # run_in_background: true (optional)
 ```
 
 **"stop slack agent"** / **"turn off slack"**:
@@ -46,13 +47,14 @@ On first start, if `~/.config/claude-slack-agent/config.json` does not exist, `a
 
 ## Handling Messages
 
-When the listener exits (task notification), always do these 3 steps:
+When the listener exits (task notification), do these 2 steps:
 
 1. `cat <output_file>` -- read the user's message
-2. `python3 inbox.py reply "response"` -- respond (advances cursor)
-3. `bash listener.sh` -- restart (run_in_background: true)
+2. `python3 inbox.py reply "response"` -- respond, advance cursor, and auto-respawn the listener
 
-If multiple messages came in fast, `check` returns all of them. Reply addresses everything, then restart.
+`inbox.py reply` now auto-respawns a detached `listener.sh` after the reply lands. The response JSON includes `listener_respawned: true` so you can confirm. Pass `--no-respawn` only on shutdown paths (right before `agent.sh stop`). A manual `bash listener.sh` is still safe (it dedups), but no longer required.
+
+If multiple messages came in fast, `check` returns all of them. One reply addresses everything; the auto-respawn covers the next batch.
 
 ## Commands
 
@@ -115,6 +117,28 @@ Multiple Claude Code sessions can run simultaneously. Each gets its own thread a
 ## Conversation Context
 
 `inbox.py check` and `inbox.py reply` include `recent_context` -- the last 5 thread messages (both human and bot) -- so responses feel conversational without re-reading the full thread.
+
+## Optional: UserPromptSubmit safety net
+
+`scripts/check-unread-hook.sh` is a belt-and-suspenders UserPromptSubmit hook. If the agent ever misses a listener completion, the next user prompt triggers this hook, which checks for unread Slack messages and surfaces a system reminder before the turn runs. To enable, add to `~/.claude/settings.json`:
+
+```json
+"hooks": {
+  "UserPromptSubmit": [
+    {
+      "hooks": [
+        {
+          "type": "command",
+          "command": "bash ~/.claude/skills/claude-slack-agent/scripts/check-unread-hook.sh",
+          "timeout": 5
+        }
+      ]
+    }
+  ]
+}
+```
+
+(Adjust the path to wherever you installed the skill.) The hook is silent when no Slack session is active for the current Claude session, and times out gracefully if the Slack API is slow.
 
 ## Technical Details
 

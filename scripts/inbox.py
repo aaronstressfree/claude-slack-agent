@@ -2,12 +2,14 @@
 """Read and reply to Aaron's messages in the session thread.
 
 Commands:
-  check          — Check for new messages (non-destructive)
-  check --advance — Check for new messages and advance cursor
-  reply <msg>    — Reply and advance cursor
+  check                     Check for new messages (non-destructive)
+  check --advance           Check for new messages and advance cursor
+  reply <msg>               Reply, advance cursor, and auto-respawn listener.sh
+  reply --no-respawn <msg>  Reply without auto-respawning (use on shutdown)
 """
 import json
 import os
+import subprocess
 import sys
 import urllib.request
 import urllib.parse
@@ -16,6 +18,9 @@ from pathlib import Path
 # Import shared API helper from config.py
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 from config import api_call
+
+SCRIPT_DIR = os.path.dirname(os.path.abspath(__file__))
+LISTENER_PATH = os.path.join(SCRIPT_DIR, "listener.sh")
 
 CONFIG_PATH = os.path.expanduser("~/.config/slack-alerts/config.json")
 BASE_STATE_DIR = os.path.expanduser("~/.config/slack-alerts")
@@ -235,8 +240,38 @@ def cmd_check(advance: bool = False):
     }, indent=2))
 
 
-def cmd_reply(message: str):
-    """Reply in thread and advance cursor past all current messages."""
+def _spawn_listener():
+    """Spawn a detached background listener process.
+
+    Safe to call when one is already running: listener.sh dedups via its own
+    PID file (or cleanly hands off). Inherits the current env so
+    CLAUDE_SESSION_ID propagates to the child.
+    """
+    sd = _state_dir()
+    os.makedirs(sd, exist_ok=True)
+    log_path = os.path.join(sd, "listener.log")
+    try:
+        log_fp = open(log_path, "a")
+        subprocess.Popen(
+            ["bash", LISTENER_PATH],
+            stdout=log_fp,
+            stderr=subprocess.STDOUT,
+            stdin=subprocess.DEVNULL,
+            start_new_session=True,
+            close_fds=True,
+        )
+        return True
+    except Exception:
+        return False
+
+
+def cmd_reply(message: str, respawn: bool = True):
+    """Reply in thread and advance cursor past all current messages.
+
+    When respawn is True (the default), spawn a fresh detached listener.sh
+    after the reply lands so the agent never loses its inbound channel. Pass
+    --no-respawn for shutdown paths.
+    """
     thread_ts = load_thread()
     token = get_post_token()
 
@@ -256,8 +291,13 @@ def cmd_reply(message: str):
     if result.get("ok") and result.get("message", {}).get("ts"):
         save_cursor(result["message"]["ts"])
 
+    respawned = False
+    if respawn and result.get("ok"):
+        respawned = _spawn_listener()
+
     print(json.dumps({
         "ok": result.get("ok", False),
+        "listener_respawned": respawned,
     }, indent=2))
 
 
@@ -271,10 +311,15 @@ if __name__ == "__main__":
         advance = "--advance" in sys.argv[2:]
         cmd_check(advance=advance)
     elif cmd == "reply":
-        if len(sys.argv) < 3:
-            print("Usage: inbox.py reply <message>", file=sys.stderr)
+        args = sys.argv[2:]
+        respawn = True
+        if "--no-respawn" in args:
+            respawn = False
+            args = [a for a in args if a != "--no-respawn"]
+        if not args:
+            print("Usage: inbox.py reply [--no-respawn] <message>", file=sys.stderr)
             sys.exit(1)
-        cmd_reply(" ".join(sys.argv[2:]))
+        cmd_reply(" ".join(args), respawn=respawn)
     else:
         print(f"Unknown command: {cmd}", file=sys.stderr)
         sys.exit(1)
