@@ -52,6 +52,18 @@ def _state_dir():
     return BASE_STATE_DIR
 
 
+def _session_prefix():
+    """Short tag for bot posts so the user can disambiguate concurrent sessions.
+
+    Returns a string like '[0d24f7] ' (6 chars + brackets + trailing space)
+    or '' when no session ID is available.
+    """
+    sid = _session_id()
+    if not sid:
+        return ""
+    return f"[{sid[:6]}] "
+
+
 _CFG = _load_cfg()
 USER_ID = _CFG["user_id"]
 TEAM_ID = _CFG["workspace_id"]
@@ -148,7 +160,7 @@ def post(text: str, thread_ts: str = None):
 
 def cmd_start(title: str):
     """Create session thread. This is the only message with the robot emoji."""
-    result = post(f":robot_face:  *{title}*")
+    result = post(f"{_session_prefix()}:robot_face:  *{title}*")
     if result.get("ok"):
         thread_ts = result["message"]["ts"]
         save_thread(thread_ts)
@@ -162,13 +174,13 @@ def cmd_post(message: str):
     """Post a message in the thread with robot emoji prefix."""
     thread_ts = load_thread()
     if not thread_ts:
-        print(json.dumps({"ok": False, "error": "no session — run start first"}))
+        print(json.dumps({"ok": False, "error": "no session, run start first"}))
         sys.exit(1)
     if not _is_thread_owner():
         # Silent no-op: this session didn't start the thread
         print(json.dumps({"ok": True, "skipped": "not thread owner"}))
         return
-    result = post(f":robot_face: {message}\n─ ─ ─", thread_ts=thread_ts)
+    result = post(f"{_session_prefix()}:robot_face: {message}\n─ ─ ─", thread_ts=thread_ts)
     print(json.dumps({"ok": result.get("ok", False)}))
 
 
@@ -186,7 +198,7 @@ def cmd_alert(message: str):
     thread_ts = load_thread()
 
     if thread_ts and _is_thread_owner():
-        post(f":robot_face: <@{USER_ID}> {message}\n─ ─ ─", thread_ts=thread_ts)
+        post(f"{_session_prefix()}:robot_face: <@{USER_ID}> {message}\n─ ─ ─", thread_ts=thread_ts)
 
     # Push notification
     data = json.dumps({
@@ -256,7 +268,7 @@ def cmd_image(file_path: str, comment: str = ""):
         "files": [{"id": file_id, "title": filename}],
         "channel_id": CHANNEL,
         "thread_ts": thread_ts or "",
-        "initial_comment": f":robot_face: {comment}\n─ ─ ─" if comment else "",
+        "initial_comment": f"{_session_prefix()}:robot_face: {comment}\n─ ─ ─" if comment else "",
     }).encode("utf-8")
     req = urllib.request.Request(
         "https://slack.com/api/files.completeUploadExternal",

@@ -62,6 +62,19 @@ def _state_dir():
     return os.path.join(BASE_STATE_DIR, "sessions", sid)
 
 
+def _session_prefix():
+    """Short tag for bot posts so Aaron can disambiguate concurrent sessions.
+
+    Returns a string like '[0d24f7] ' (6 chars + brackets + trailing space)
+    or '' when no session ID is available. Keep it cheap and stable so it
+    doesn't churn across messages in the same thread.
+    """
+    sid = _session_id()
+    if not sid:
+        return ""
+    return f"[{sid[:6]}] "
+
+
 _CFG = _load_cfg()
 USER_ID = _CFG["user_id"]
 CHANNEL = _CFG["channel_id"]
@@ -190,9 +203,13 @@ def get_human_messages(since: str):
         if thread_ts and msg["ts"] == thread_ts:
             continue
         # Skip our own messages posted with user token (no bot_id).
-        # Bot messages always start with :robot_face: or :loading_: prefix.
+        # Bot messages always start with :robot_face: or :loading_: prefix,
+        # optionally preceded by a session prefix like "[abc123] ".
         text = msg.get("text", "")
-        if text.startswith(":robot_face:") or text.startswith(":loading_:") or text.startswith("_Session ended"):
+        stripped = text
+        if stripped.startswith("[") and "] " in stripped[:12]:
+            stripped = stripped.split("] ", 1)[1]
+        if stripped.startswith(":robot_face:") or stripped.startswith(":loading_:") or stripped.startswith("_Session ended"):
             continue
         messages.append({"ts": msg["ts"], "text": text})
         if msg["ts"] > latest:
@@ -239,8 +256,12 @@ def get_recent_context(limit: int = 5):
         # Skip ack messages
         if text.strip() in ("...", ":loading_:"):
             continue
-        # Identify agent messages by bot_id OR :robot_face: prefix (user token fallback)
-        is_agent = bool(msg.get("bot_id")) or text.startswith(":robot_face:")
+        # Identify agent messages by bot_id OR :robot_face: prefix (user token fallback).
+        # Strip a possible session prefix like "[abc123] " before checking.
+        stripped = text
+        if stripped.startswith("[") and "] " in stripped[:12]:
+            stripped = stripped.split("] ", 1)[1]
+        is_agent = bool(msg.get("bot_id")) or stripped.startswith(":robot_face:")
         who = "agent" if is_agent else "aaron"
         context.append({"who": who, "text": text})
 
@@ -355,9 +376,11 @@ def cmd_reply(message: str, respawn: bool = True, dry_run: bool = False):
     """
     if dry_run:
         respawned = _spawn_listener() if respawn else False
+        text = f"{_session_prefix()}:robot_face: {message}\n─ ─ ─"
         print(json.dumps({
             "ok": True,
             "dry_run": True,
+            "would_post": text,
             "listener_respawned": respawned,
             "listener_alive": _listener_alive(),
         }, indent=2))
@@ -366,7 +389,7 @@ def cmd_reply(message: str, respawn: bool = True, dry_run: bool = False):
     thread_ts = load_thread()
     token = get_post_token()
 
-    text = f":robot_face: {message}\n─ ─ ─"
+    text = f"{_session_prefix()}:robot_face: {message}\n─ ─ ─"
     payload = {"channel": CHANNEL, "text": text}
     if thread_ts:
         payload["thread_ts"] = thread_ts

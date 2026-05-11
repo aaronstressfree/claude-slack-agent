@@ -74,6 +74,12 @@ while true; do
     python3 "$SCRIPTS_DIR/alert.py" ack 2>>"$LOGFILE"
     # Output to stdout, Claude sees this in the task notification
     echo "$result"
+    # Spawn a fresh listener before exiting so the gap is closed.
+    # Our trap will rm $PIDFILE on exit; the fresh listener's PID-file
+    # dedup check will succeed once that happens. If `inbox.py reply`
+    # also spawns a listener, the single-listener invariant still holds.
+    nohup bash "$SCRIPTS_DIR/listener.sh" >/dev/null 2>&1 < /dev/null &
+    disown 2>/dev/null || true
     exit 0
   fi
   sleep 6
