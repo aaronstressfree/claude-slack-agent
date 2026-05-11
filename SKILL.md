@@ -9,7 +9,7 @@ allowed-tools:
   - Bash(python3 */slack-agent/scripts/config.py:*)
 metadata:
   author: claude
-  version: "1.1"
+  version: "2.0"
   status: stable
 ---
 
@@ -34,7 +34,8 @@ When starting a session, use a descriptive title based on what the session is do
 **"start slack agent"** / **"turn on slack"**:
 ```bash
 bash scripts/agent.sh start "Brief description"
-# listener auto-spawns inside agent.sh start; explicit call below is optional
+# listener AND healthcheck watchdog auto-spawn inside agent.sh start.
+# Both scripts are single-instance, so duplicate calls are no-ops.
 bash scripts/listener.sh  # run_in_background: true (optional)
 ```
 
@@ -43,16 +44,24 @@ bash scripts/listener.sh  # run_in_background: true (optional)
 bash scripts/agent.sh stop
 ```
 
-On first start, if `~/.config/claude-slack-agent/config.json` does not exist, `agent.sh` automatically runs `config.py setup` to detect your Slack identity, find or create your private agent channel, and save config. No manual setup needed beyond having Slack credentials at `~/.config/slack-skill/credentials.json`.
+On first start, if `~/.config/slack-alerts/config.json` does not exist, `agent.sh` automatically runs `config.py setup` to detect your Slack identity, find or create your private agent channel, and save config. No manual setup needed beyond having Slack credentials at `~/.config/slack-skill/credentials.json`.
+
+## Listener invariants (one listener per session, period)
+
+This is the core reliability contract. Three independent layers make sure the bot stays alive:
+
+1. **Single-listener invariant.** `listener.sh` claims `$STATE_DIR/listener.pid` on startup. If a live listener already owns the slot, a new invocation exits silently (rc 0). It is physically impossible for two listeners to run for one session. Spam-calling `listener.sh` 100 times in a row results in exactly one process. Verify with `ps aux | grep listener.sh`.
+2. **Auto-respawn after reply, with self-test.** `inbox.py reply` spawns a fresh listener and verifies the PID file points at a live process. The JSON output includes `listener_respawned` AND `listener_alive`, both grounded in real PID checks. If either is false, surface the failure.
+3. **Watchdog catches silent death.** `healthcheck.sh` auto-starts with `agent.sh start` and polls the listener PID every 5 minutes (override with `HEALTHCHECK_INTERVAL`). If the listener dies between replies, the watchdog posts a single `:warning: Listener died, restarting now.` and respawns it. Silent in the happy path, no idle pings.
+
+First-debug step when you suspect silence: `python3 scripts/inbox.py health`.
 
 ## Handling Messages
 
 When the listener exits (task notification), do these 2 steps:
 
 1. `cat <output_file>` -- read the user's message
-2. `python3 inbox.py reply "response"` -- respond, advance cursor, and auto-respawn the listener
-
-`inbox.py reply` now auto-respawns a detached `listener.sh` after the reply lands. The response JSON includes `listener_respawned: true` so you can confirm. Pass `--no-respawn` only on shutdown paths (right before `agent.sh stop`). A manual `bash listener.sh` is still safe (it dedups), but no longer required.
+2. `python3 inbox.py reply "response"` -- respond, advance cursor, respawn listener with self-test
 
 If multiple messages came in fast, `check` returns all of them. One reply addresses everything; the auto-respawn covers the next batch.
 
@@ -60,9 +69,11 @@ If multiple messages came in fast, `check` returns all of them. One reply addres
 
 | Command | Purpose |
 |---------|---------|
-| `agent.sh start <title>` | Create thread + start caffeinate |
-| `agent.sh stop` | End session + kill caffeinate |
-| `listener.sh` | Background poll, exits on message |
+| `agent.sh start <title>` | Create thread, start caffeinate, listener, and healthcheck watchdog |
+| `agent.sh stop` | End session, kill all child processes, clear PID files |
+| `listener.sh` | Background poll. Single-instance, exits on message |
+| `healthcheck.sh` | Background watchdog. Restarts a dead listener |
+| `heartbeat.sh` | Optional status poster (reads $STATE_DIR/status.txt) |
 | `alert.py start <title>` | Create thread |
 | `alert.py post <msg>` | Post update (robot prefix + divider) |
 | `alert.py alert <msg>` | Post with @mention + push notification |
@@ -71,7 +82,9 @@ If multiple messages came in fast, `check` returns all of them. One reply addres
 | `alert.py image <path> [caption]` | Upload screenshot/image to thread |
 | `run.sh <desc> <cmd> [args]` | Run command, auto-post start/done/failed |
 | `inbox.py check` | Check for messages + recent context |
-| `inbox.py reply <msg>` | Reply (robot prefix + divider) + advance cursor |
+| `inbox.py reply <msg>` | Reply, advance cursor, respawn listener with self-test |
+| `inbox.py reply --dry-run` | Test respawn path without posting |
+| `inbox.py health` | Report listener_alive, pid, thread_ts. Read-only |
 | `config.py setup` | Interactive onboarding (detect user, find/create channel) |
 | `config.py show` | Display current config |
 

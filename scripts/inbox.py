@@ -2,25 +2,28 @@
 """Read and reply to Aaron's messages in the session thread.
 
 Commands:
-  check                     Check for new messages (non-destructive)
-  check --advance           Check for new messages and advance cursor
-  reply <msg>               Reply, advance cursor, and auto-respawn listener.sh
-  reply --no-respawn <msg>  Reply without auto-respawning (use on shutdown)
+  check            Check for new messages (non-destructive)
+  check --advance  Check for new messages and advance cursor
+  reply <msg>      Reply and advance cursor; auto-respawns listener.sh
+  reply --no-respawn <msg>
+                   Reply without auto-respawning the listener (use on shutdown)
 """
 import json
 import os
 import subprocess
 import sys
+import tempfile
+import time
 import urllib.request
 import urllib.parse
 from pathlib import Path
 
+SCRIPT_DIR = os.path.dirname(os.path.abspath(__file__))
+LISTENER_PATH = os.path.join(SCRIPT_DIR, "listener.sh")
+
 # Import shared API helper from config.py
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 from config import api_call
-
-SCRIPT_DIR = os.path.dirname(os.path.abspath(__file__))
-LISTENER_PATH = os.path.join(SCRIPT_DIR, "listener.sh")
 
 CONFIG_PATH = os.path.expanduser("~/.config/slack-alerts/config.json")
 BASE_STATE_DIR = os.path.expanduser("~/.config/slack-alerts")
@@ -51,11 +54,12 @@ def _session_id():
 
 
 def _state_dir():
-    """Return session-specific state dir, or global fallback."""
+    """Return session-specific state dir. Requires CLAUDE_SESSION_ID, with
+    no global fallback (that's what caused the cross-session thread spam)."""
     sid = _session_id()
-    if sid:
-        return os.path.join(BASE_STATE_DIR, "sessions", sid)
-    return BASE_STATE_DIR
+    if not sid:
+        return None
+    return os.path.join(BASE_STATE_DIR, "sessions", sid)
 
 
 _CFG = _load_cfg()
@@ -79,22 +83,19 @@ def get_post_token():
 
 
 def _thread_path():
-    return os.path.join(_state_dir(), "thread.json")
+    sd = _state_dir()
+    return os.path.join(sd, "thread.json") if sd else None
 
 
 def _cursor_path():
-    return os.path.join(_state_dir(), "cursor.json")
+    sd = _state_dir()
+    return os.path.join(sd, "cursor.json") if sd else None
 
 
 def load_thread():
     tp = _thread_path()
-    if os.path.exists(tp):
+    if tp and os.path.exists(tp):
         with open(tp) as f:
-            return json.load(f).get("thread_ts")
-    # Backward compat: check old global session-thread.json
-    global_path = os.path.join(BASE_STATE_DIR, "session-thread.json")
-    if os.path.exists(global_path):
-        with open(global_path) as f:
             return json.load(f).get("thread_ts")
     return None
 
@@ -106,27 +107,46 @@ def _cursor_key():
 
 def load_cursor():
     cp = _cursor_path()
-    if Path(cp).exists():
+    if cp and Path(cp).exists():
         with open(cp) as f:
-            return json.load(f).get(_cursor_key(), "0")
-    # Backward compat: check old global inbox-cursor.json
-    global_cursor = os.path.join(BASE_STATE_DIR, "inbox-cursor.json")
-    if Path(global_cursor).exists():
-        with open(global_cursor) as f:
             return json.load(f).get(_cursor_key(), "0")
     return "0"
 
 
 def save_cursor(ts: str):
+    """Write the cursor atomically: tmp file in the same dir, then rename.
+
+    Atomic write prevents a partial-write race if two processes try to
+    update the cursor simultaneously (defense in depth alongside the
+    single-listener invariant). Rename within the same filesystem is
+    atomic on POSIX, so readers either see the old cursor or the new one,
+    never a half-written file.
+    """
     cp = _cursor_path()
-    os.makedirs(_state_dir(), exist_ok=True)
+    sd = _state_dir()
+    if not cp or not sd:
+        return
+    os.makedirs(sd, exist_ok=True)
     data = {}
     if Path(cp).exists():
-        with open(cp) as f:
-            data = json.load(f)
+        try:
+            with open(cp) as f:
+                data = json.load(f)
+        except (json.JSONDecodeError, OSError):
+            data = {}
     data[_cursor_key()] = ts
-    with open(cp, "w") as f:
-        json.dump(data, f)
+    fd, tmp_path = tempfile.mkstemp(prefix=".cursor.", dir=sd)
+    try:
+        with os.fdopen(fd, "w") as f:
+            json.dump(data, f)
+        os.replace(tmp_path, cp)
+    except OSError:
+        # Best-effort cleanup; do not raise (a missed cursor advance is
+        # recoverable, but a thrown exception would lose the reply.)
+        try:
+            os.unlink(tmp_path)
+        except OSError:
+            pass
 
 
 def fetch_thread_replies(since: str):
@@ -169,11 +189,15 @@ def get_human_messages(since: str):
             continue
         if thread_ts and msg["ts"] == thread_ts:
             continue
-        messages.append({"ts": msg["ts"], "text": msg.get("text", "")})
+        # Skip our own messages posted with user token (no bot_id).
+        # Bot messages always start with :robot_face: or :loading_: prefix.
+        text = msg.get("text", "")
+        if text.startswith(":robot_face:") or text.startswith(":loading_:") or text.startswith("_Session ended"):
+            continue
+        messages.append({"ts": msg["ts"], "text": text})
         if msg["ts"] > latest:
             latest = msg["ts"]
 
-    messages.reverse()  # oldest first
     return messages, latest
 
 
@@ -200,7 +224,7 @@ def get_recent_context(limit: int = 5):
     try:
         result = api_call(req)
     except Exception:
-        return []  # Gracefully degrade — context is nice-to-have, not critical
+        return []  # Gracefully degrade; context is nice-to-have, not critical
     if not result.get("ok"):
         return []
 
@@ -211,11 +235,14 @@ def get_recent_context(limit: int = 5):
             continue
         if msg.get("subtype"):
             continue
+        text = msg.get("text", "")
         # Skip ack messages
-        if msg.get("text", "").strip() == "...":
+        if text.strip() in ("...", ":loading_:"):
             continue
-        who = "agent" if msg.get("bot_id") else "aaron"
-        context.append({"who": who, "text": msg.get("text", "")})
+        # Identify agent messages by bot_id OR :robot_face: prefix (user token fallback)
+        is_agent = bool(msg.get("bot_id")) or text.startswith(":robot_face:")
+        who = "agent" if is_agent else "aaron"
+        context.append({"who": who, "text": text})
 
     # Return last N
     return context[-limit:]
@@ -230,48 +257,112 @@ def cmd_check(advance: bool = False):
     if advance and latest > cursor:
         save_cursor(latest)
 
-    print(json.dumps({
+    result = {
         "ok": True,
         "channel": CHANNEL,
         "thread_ts": load_thread(),
         "new_messages": len(messages),
         "messages": messages,
-        "recent_context": get_recent_context(),
-    }, indent=2))
+    }
+    # Only fetch recent context when there are new messages (saves an API call per poll)
+    if messages:
+        result["recent_context"] = get_recent_context()
+
+    print(json.dumps(result, indent=2))
+
+
+def _listener_alive():
+    """Return True if the session's listener PID file points to a live process.
+
+    Used by `_spawn_listener` to verify a respawn actually took, and by
+    `cmd_health` so external callers can confirm the inbound channel.
+    """
+    sd = _state_dir()
+    if not sd:
+        return False
+    pidfile = os.path.join(sd, "listener.pid")
+    try:
+        with open(pidfile) as f:
+            pid = int(f.read().strip())
+    except (FileNotFoundError, ValueError, OSError):
+        return False
+    if pid <= 0:
+        return False
+    try:
+        os.kill(pid, 0)
+    except (ProcessLookupError, PermissionError):
+        return False
+    except OSError:
+        return False
+    return True
 
 
 def _spawn_listener():
-    """Spawn a detached background listener process.
+    """Spawn a detached background listener process, then self-test.
 
-    Safe to call when one is already running: listener.sh dedups via its own
-    PID file (or cleanly hands off). Inherits the current env so
-    CLAUDE_SESSION_ID propagates to the child.
+    listener.sh enforces the single-listener invariant via its own PID file:
+    a second spawn while one is already alive becomes a silent no-op. So
+    "did the spawn take" is really "is *some* listener alive after we
+    spawned" not "did our specific child survive". We retry once if the
+    PID file is missing after 0.5s, then once more after a longer wait,
+    then give up and report `false` so the caller surfaces the failure.
     """
     sd = _state_dir()
+    if not sd:
+        return False
     os.makedirs(sd, exist_ok=True)
     log_path = os.path.join(sd, "listener.log")
-    try:
-        log_fp = open(log_path, "a")
-        subprocess.Popen(
-            ["bash", LISTENER_PATH],
-            stdout=log_fp,
-            stderr=subprocess.STDOUT,
-            stdin=subprocess.DEVNULL,
-            start_new_session=True,
-            close_fds=True,
-        )
-        return True
-    except Exception:
+
+    def _spawn_once():
+        try:
+            log_fp = open(log_path, "a")
+            subprocess.Popen(
+                ["bash", LISTENER_PATH],
+                stdout=log_fp,
+                stderr=subprocess.STDOUT,
+                stdin=subprocess.DEVNULL,
+                start_new_session=True,
+                close_fds=True,
+            )
+            return True
+        except Exception:
+            return False
+
+    if not _spawn_once():
         return False
+    time.sleep(0.5)
+    if _listener_alive():
+        return True
+
+    # Retry once. The first spawn may have lost a race with another spawn
+    # call that already cleaned its PID file mid-flight.
+    if not _spawn_once():
+        return False
+    time.sleep(0.8)
+    return _listener_alive()
 
 
-def cmd_reply(message: str, respawn: bool = True):
+def cmd_reply(message: str, respawn: bool = True, dry_run: bool = False):
     """Reply in thread and advance cursor past all current messages.
 
-    When respawn is True (the default), spawn a fresh detached listener.sh
-    after the reply lands so the agent never loses its inbound channel. Pass
-    --no-respawn for shutdown paths.
+    When respawn is True (the default), spawn a fresh background listener
+    after the reply succeeds and verify it actually came up. The result
+    includes `listener_respawned`, which is now grounded in a PID-file
+    check (was a blind `true` previously).
+
+    `dry_run=True` skips the Slack post but still exercises the respawn
+    path. Useful for tests.
     """
+    if dry_run:
+        respawned = _spawn_listener() if respawn else False
+        print(json.dumps({
+            "ok": True,
+            "dry_run": True,
+            "listener_respawned": respawned,
+            "listener_alive": _listener_alive(),
+        }, indent=2))
+        return
+
     thread_ts = load_thread()
     token = get_post_token()
 
@@ -287,7 +378,7 @@ def cmd_reply(message: str, respawn: bool = True):
     )
     result = api_call(req)
 
-    # Use the reply's timestamp as cursor — anything before our reply is "seen"
+    # Use the reply's timestamp as cursor; anything before our reply is "seen"
     if result.get("ok") and result.get("message", {}).get("ts"):
         save_cursor(result["message"]["ts"])
 
@@ -298,12 +389,39 @@ def cmd_reply(message: str, respawn: bool = True):
     print(json.dumps({
         "ok": result.get("ok", False),
         "listener_respawned": respawned,
+        "listener_alive": _listener_alive(),
+    }, indent=2))
+
+
+def cmd_health():
+    """Report listener liveness and session state. Read-only.
+
+    Used by the watchdog (healthcheck.sh) and by Aaron when he wants to
+    confirm the bot is alive without restarting anything.
+    """
+    sd = _state_dir()
+    alive = _listener_alive()
+    pid = None
+    if sd:
+        pidfile = os.path.join(sd, "listener.pid")
+        try:
+            with open(pidfile) as f:
+                pid = int(f.read().strip())
+        except (FileNotFoundError, ValueError, OSError):
+            pid = None
+    print(json.dumps({
+        "ok": True,
+        "session_id": _session_id() or None,
+        "state_dir": sd,
+        "thread_ts": load_thread(),
+        "listener_alive": alive,
+        "listener_pid": pid,
     }, indent=2))
 
 
 if __name__ == "__main__":
     if len(sys.argv) < 2:
-        print("Usage: inbox.py [check [--advance]|reply <message>]", file=sys.stderr)
+        print("Usage: inbox.py [check [--advance]|reply [--no-respawn] [--dry-run] <msg>|health]", file=sys.stderr)
         sys.exit(1)
 
     cmd = sys.argv[1]
@@ -313,13 +431,19 @@ if __name__ == "__main__":
     elif cmd == "reply":
         args = sys.argv[2:]
         respawn = True
+        dry_run = False
         if "--no-respawn" in args:
             respawn = False
             args = [a for a in args if a != "--no-respawn"]
-        if not args:
-            print("Usage: inbox.py reply [--no-respawn] <message>", file=sys.stderr)
+        if "--dry-run" in args:
+            dry_run = True
+            args = [a for a in args if a != "--dry-run"]
+        if not args and not dry_run:
+            print("Usage: inbox.py reply [--no-respawn] [--dry-run] <message>", file=sys.stderr)
             sys.exit(1)
-        cmd_reply(" ".join(args), respawn=respawn)
+        cmd_reply(" ".join(args) if args else "", respawn=respawn, dry_run=dry_run)
+    elif cmd == "health":
+        cmd_health()
     else:
         print(f"Unknown command: {cmd}", file=sys.stderr)
         sys.exit(1)

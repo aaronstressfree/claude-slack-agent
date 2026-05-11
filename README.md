@@ -51,12 +51,15 @@ That's the whole interface. Two phrases.
 
 **Important:** The agent does not auto-start. Every time you open Claude Code and want Slack access, say "start slack agent". When you're done, say "stop slack agent" -- it keeps things clean and lets Claude know you're finished.
 
-## Listener auto-respawn
+## Reliability (one listener per session, period)
 
-The most common way Claude goes silent in long Slack sessions is forgetting to restart `listener.sh` after replying. Two layers prevent that now:
+The bot is bulletproof against the historical failure modes (listener stacking, silent death, missed messages). Three independent layers make sure it stays alive:
 
-1. **Auto-respawn on reply.** `python3 scripts/inbox.py reply "..."` spawns a fresh background `listener.sh` as part of the reply, so a new listener is always waiting for the next message. The response JSON includes `listener_respawned: true`. Pass `--no-respawn` if you're shutting down.
-2. **Auto-spawn on start.** `bash scripts/agent.sh start` now spawns the listener for you. You no longer need a separate `bash scripts/listener.sh` call right after start (though it stays safe as a no-op).
+1. **Single-listener invariant.** `listener.sh` claims a session-scoped PID file on startup. If a live listener already owns the slot, a new invocation exits silently. Spam-calling `listener.sh` 100 times results in exactly one running process. No more stacking.
+2. **Auto-respawn on reply, with self-test.** `python3 scripts/inbox.py reply "..."` spawns a fresh listener and verifies via the PID file that a listener is actually alive afterward. The JSON output includes `listener_respawned` AND `listener_alive`, both grounded in real PID checks (no more blind `true`).
+3. **Watchdog (healthcheck.sh).** Auto-starts with `agent.sh start`. Polls the listener PID every 5 minutes (override with `HEALTHCHECK_INTERVAL`). If the listener dies between replies, the watchdog posts a single `:warning: Listener died, restarting now.` and respawns it. Silent in the happy path, no idle pings.
+
+First debug step if you suspect the bot has gone silent: `python3 scripts/inbox.py health`. Returns listener_alive, listener_pid, thread_ts. Read-only and instant.
 
 ## Optional: UserPromptSubmit safety net
 

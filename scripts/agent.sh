@@ -3,35 +3,69 @@
 #        agent.sh stop
 SCRIPTS_DIR="$(cd "$(dirname "$0")" && pwd)"
 
-# Session isolation: use CLAUDE_SESSION_ID if available.
-# If not set, use global state dir (backward compatible).
+# Session isolation: REQUIRE CLAUDE_SESSION_ID. Falling back to a global
+# state dir is what caused cross-session bleed and the "Session started"
+# spam; every hook without a session ID would target the same legacy file.
 SESSION_ID="${CLAUDE_SESSION_ID:-}"
-if [ -n "$SESSION_ID" ]; then
-  STATE_DIR="$HOME/.config/slack-alerts/sessions/$SESSION_ID"
-else
-  STATE_DIR="$HOME/.config/slack-alerts"
+if [ -z "$SESSION_ID" ]; then
+  echo '{"status": "error", "message": "CLAUDE_SESSION_ID not set; refusing to operate on global state"}' >&2
+  exit 1
 fi
+STATE_DIR="$HOME/.config/slack-alerts/sessions/$SESSION_ID"
 mkdir -p "$STATE_DIR"
 
-# Kill this session's listener by PID file first, fall back to pattern match
+# Kill this session's listener by PID file first, fall back to pattern match.
+# Always clears the PID file at the end so a stale file never lingers and
+# blocks a future listener.sh from claiming the slot.
 kill_session_listener() {
-  # Prefer PID file (reliable, session-scoped)
   if [ -f "$STATE_DIR/listener.pid" ]; then
     local pid
     pid=$(cat "$STATE_DIR/listener.pid")
-    # Verify PID is still a listener process before killing
     if [ -n "$pid" ] && kill -0 "$pid" 2>/dev/null; then
       kill "$pid" 2>/dev/null
     fi
     rm -f "$STATE_DIR/listener.pid"
-    return
   fi
 
-  # Fall back to pattern match — only use session-scoped pattern
+  # Defensive sweep: any stragglers for this session that lost their PID
+  # file (process forked oddly, kernel race, etc.) get cleaned up here.
   if [ -n "$SESSION_ID" ]; then
     pkill -f "CLAUDE_SESSION_ID=$SESSION_ID.*listener.sh" 2>/dev/null
   fi
-  # If no SESSION_ID and no PID file, don't kill anything — too risky
+  # Explicit final cleanup: ensure no stale PID file survives.
+  rm -f "$STATE_DIR/listener.pid"
+}
+
+# Kill this session's heartbeat by PID file
+kill_session_heartbeat() {
+  if [ -f "$STATE_DIR/heartbeat.pid" ]; then
+    local pid
+    pid=$(cat "$STATE_DIR/heartbeat.pid")
+    if [ -n "$pid" ] && kill -0 "$pid" 2>/dev/null; then
+      kill "$pid" 2>/dev/null
+    fi
+    rm -f "$STATE_DIR/heartbeat.pid"
+  fi
+  if [ -n "$SESSION_ID" ]; then
+    pkill -f "CLAUDE_SESSION_ID=$SESSION_ID.*heartbeat.sh" 2>/dev/null
+  fi
+  rm -f "$STATE_DIR/heartbeat.pid"
+}
+
+# Kill this session's healthcheck (watchdog) by PID file
+kill_session_healthcheck() {
+  if [ -f "$STATE_DIR/healthcheck.pid" ]; then
+    local pid
+    pid=$(cat "$STATE_DIR/healthcheck.pid")
+    if [ -n "$pid" ] && kill -0 "$pid" 2>/dev/null; then
+      kill "$pid" 2>/dev/null
+    fi
+    rm -f "$STATE_DIR/healthcheck.pid"
+  fi
+  if [ -n "$SESSION_ID" ]; then
+    pkill -f "CLAUDE_SESSION_ID=$SESSION_ID.*healthcheck.sh" 2>/dev/null
+  fi
+  rm -f "$STATE_DIR/healthcheck.pid"
 }
 
 # Kill a caffeinate process by PID file, with validation
@@ -57,12 +91,12 @@ case "$1" in
     TITLE="${*:2}"
     [ -z "$TITLE" ] && TITLE="Claude Code session"
 
-    # Check if this session already has an active thread — skip re-creating
-    # Check both session-scoped and global locations (alert.py may write to either)
+    # Check if this session already has an active thread; skip re-creating.
+    # Strictly session-scoped: do NOT consult the legacy global path, which
+    # used to magnetize spam from sessions running hooks without a session ID.
     THREAD_FILE="$STATE_DIR/thread.json"
-    GLOBAL_THREAD="$HOME/.config/slack-alerts/thread.json"
-    if { [ -f "$THREAD_FILE" ] && [ -s "$THREAD_FILE" ]; } || { [ -f "$GLOBAL_THREAD" ] && [ -s "$GLOBAL_THREAD" ]; }; then
-      # Session already running — just ensure caffeinate is alive
+    if [ -f "$THREAD_FILE" ] && [ -s "$THREAD_FILE" ]; then
+      # Session already running; just ensure caffeinate is alive
       if [ -f "$STATE_DIR/caffeinate.pid" ]; then
         CAFF_PID=$(cat "$STATE_DIR/caffeinate.pid")
         if ! kill -0 "$CAFF_PID" 2>/dev/null; then
@@ -83,27 +117,36 @@ case "$1" in
     # Kill any existing caffeinate from previous sessions before spawning new one
     kill_caffeinate "$STATE_DIR/caffeinate.pid"
 
-    # Keep Mac awake — PID stored per-session
+    # Keep Mac awake; PID stored per-session
     caffeinate -d -i -s &
     echo $! > "$STATE_DIR/caffeinate.pid"
 
-    python3 "$SCRIPTS_DIR/alert.py" start "$TITLE"
+    if ! python3 "$SCRIPTS_DIR/alert.py" start "$TITLE"; then
+      echo '{"status": "error", "message": "Failed to create Slack thread"}'
+      exit 1
+    fi
     python3 "$SCRIPTS_DIR/alert.py" post "Ready. Reply here to send instructions."
 
     # Auto-spawn listener so callers don't have to remember the second command.
-    # listener.sh has its own dedup (or the pkill above already cleared stale
-    # ones), so a duplicate spawn is harmless.
+    # listener.sh has its own PID-file dedup, so a duplicate call is a no-op.
     LOGFILE="$STATE_DIR/listener.log"
-    mkdir -p "$STATE_DIR"
     nohup bash "$SCRIPTS_DIR/listener.sh" >> "$LOGFILE" 2>&1 < /dev/null &
+    disown 2>/dev/null || true
+
+    # Auto-spawn the healthcheck watchdog. It restarts the listener if it
+    # ever dies silently. Single-instance, so a duplicate call is a no-op.
+    HC_LOG="$STATE_DIR/healthcheck.log"
+    nohup bash "$SCRIPTS_DIR/healthcheck.sh" >> "$HC_LOG" 2>&1 < /dev/null &
     disown 2>/dev/null || true
 
     echo '{"status": "started"}'
     ;;
 
   stop)
-    # Kill only this session's listener
+    # Kill this session's listener, heartbeat, and healthcheck watchdog
     kill_session_listener
+    kill_session_heartbeat
+    kill_session_healthcheck
 
     # Stop this session's caffeinate (with process name validation + pkill fallback)
     kill_caffeinate "$STATE_DIR/caffeinate.pid"
@@ -115,14 +158,31 @@ case "$1" in
 
     python3 "$SCRIPTS_DIR/alert.py" end 2>/dev/null
 
-    # Clear thread file so next start creates a fresh session
-    rm -f "$STATE_DIR/thread.json" "$STATE_DIR/session-thread.json"
+    # Clear thread + status file so next start creates a fresh session
+    rm -f "$STATE_DIR/thread.json" "$STATE_DIR/session-thread.json" "$STATE_DIR/status.txt"
 
     echo '{"status": "stopped"}'
     ;;
 
+  status)
+    # Set the current "what I'm doing" line for the heartbeat poster.
+    # Usage: agent.sh status "building the doc site"
+    STATUS_TEXT="${*:2}"
+    if [ -z "$STATUS_TEXT" ]; then
+      # Read mode; print current status
+      if [ -f "$STATE_DIR/status.txt" ]; then
+        cat "$STATE_DIR/status.txt"
+      else
+        echo ""
+      fi
+      exit 0
+    fi
+    echo "$STATUS_TEXT" > "$STATE_DIR/status.txt"
+    echo '{"status": "set"}'
+    ;;
+
   *)
-    echo "Usage: agent.sh [start <description>|stop]" >&2
+    echo "Usage: agent.sh [start <description>|stop|status [text]]" >&2
     exit 1
     ;;
 esac
