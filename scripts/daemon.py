@@ -177,7 +177,7 @@ def append_to_queue(state_dir: Path, message: dict):
 
 
 def is_human_message(msg: dict, user_id: str, thread_ts: str) -> bool:
-    """Filter logic: only Aaron's real messages, not bot echoes or parent."""
+    """Filter logic: only the user's real messages, not bot echoes or parent."""
     if msg.get("bot_id"):
         return False
     if msg.get("subtype"):

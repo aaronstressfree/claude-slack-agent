@@ -1,13 +1,13 @@
 #!/bin/bash
 # Claude Slack Agent installer
-# Downloads and installs the skill into ~/.claude/skills/0-slack-alerts/
+# Downloads and installs the skill into ~/.claude/skills/claude-slack-agent/
 
 set -e
 
 REPO="aaronstressfree/claude-slack-agent"
 BRANCH="main"
 BASE_URL="https://raw.githubusercontent.com/${REPO}/${BRANCH}"
-DEST="$HOME/.claude/skills/0-slack-alerts"
+DEST="$HOME/.claude/skills/claude-slack-agent"
 
 echo ""
 echo "  Installing Claude Slack Agent..."

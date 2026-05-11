@@ -53,7 +53,7 @@ def _state_dir():
 
 
 def _session_prefix():
-    """Short tag for bot posts so Aaron can disambiguate concurrent sessions.
+    """Short tag for bot posts so the user can disambiguate concurrent sessions.
 
     Returns a string like '[0d24f7] ' (6 chars + brackets + trailing space)
     or '' when no session ID is available.

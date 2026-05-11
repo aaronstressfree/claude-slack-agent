@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Read and reply to Aaron's messages in the session thread.
+"""Read and reply to the user's messages in the session thread.
 
 Commands:
   check            Check for new messages (non-destructive)
@@ -63,7 +63,7 @@ def _state_dir():
 
 
 def _session_prefix():
-    """Short tag for bot posts so Aaron can disambiguate concurrent sessions.
+    """Short tag for bot posts so the user can disambiguate concurrent sessions.
 
     Returns a string like '[0d24f7] ' (6 chars + brackets + trailing space)
     or '' when no session ID is available. Keep it cheap and stable so it
@@ -184,7 +184,7 @@ def fetch_thread_replies(since: str):
 
 
 def get_human_messages(since: str):
-    """Get Aaron's messages (no bot_id, no subtype) newer than `since`."""
+    """Get user messages (no bot_id, no subtype) newer than `since`."""
     thread_ts = load_thread()
     result = fetch_thread_replies(since)
     if not result.get("ok"):
@@ -262,7 +262,7 @@ def get_recent_context(limit: int = 5):
         if stripped.startswith("[") and "] " in stripped[:12]:
             stripped = stripped.split("] ", 1)[1]
         is_agent = bool(msg.get("bot_id")) or stripped.startswith(":robot_face:")
-        who = "agent" if is_agent else "aaron"
+        who = "agent" if is_agent else "user"
         context.append({"who": who, "text": text})
 
     # Return last N
@@ -422,8 +422,8 @@ def cmd_reply(message: str, respawn: bool = True, dry_run: bool = False):
 def cmd_health():
     """Report listener liveness and session state. Read-only.
 
-    Used by the watchdog (healthcheck.sh) and by Aaron when he wants to
-    confirm the bot is alive without restarting anything.
+    Used by the watchdog (healthcheck.sh) and by the user when they want
+    to confirm the bot is alive without restarting anything.
     """
     sd = _state_dir()
     alive = _listener_alive()

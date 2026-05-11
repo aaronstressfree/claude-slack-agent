@@ -1,13 +1,13 @@
 ---
-name: 0-slack-alerts
+name: claude-slack-agent
 description: "Two-way Slack agent for chatting via a dedicated private agent channel. Say 'start slack agent' to begin, 'stop slack agent' to end. Say 'set up slack agent' to run conversational onboarding. Supports multiple concurrent sessions, image uploads, and conversation context."
 allowed-tools:
-  - Bash(*/0-slack-alerts/scripts/agent.sh:*)
-  - Bash(*/0-slack-alerts/scripts/listener.sh:*)
-  - Bash(*/0-slack-alerts/scripts/healthcheck.sh:*)
-  - Bash(python3 */0-slack-alerts/scripts/alert.py:*)
-  - Bash(python3 */0-slack-alerts/scripts/inbox.py:*)
-  - Bash(python3 */0-slack-alerts/scripts/config.py:*)
+  - Bash(*/claude-slack-agent/scripts/agent.sh:*)
+  - Bash(*/claude-slack-agent/scripts/listener.sh:*)
+  - Bash(*/claude-slack-agent/scripts/healthcheck.sh:*)
+  - Bash(python3 */claude-slack-agent/scripts/alert.py:*)
+  - Bash(python3 */claude-slack-agent/scripts/inbox.py:*)
+  - Bash(python3 */claude-slack-agent/scripts/config.py:*)
 metadata:
   author: claude
   version: "11.0"
@@ -155,7 +155,7 @@ Multiple Claude Code sessions run simultaneously. Each gets its own thread and s
       "hooks": [
         {
           "type": "command",
-          "command": "bash ~/.claude/skills/0-slack-alerts/scripts/check-unread-hook.sh",
+          "command": "bash ~/.claude/skills/claude-slack-agent/scripts/check-unread-hook.sh",
           "timeout": 5
         }
       ]
@@ -179,7 +179,7 @@ Multiple Claude Code sessions run simultaneously. Each gets its own thread and s
 | File | Why |
 |---|---|
 | `scripts/daemon.py` | Launchd architecture. Detached process does not fire harness task notifications, so agent never sees inbound messages |
-| `LaunchAgents/xyz.aaronstevens.slack-alerts.plist` | Same reason |
+| `LaunchAgents/*.plist` | Same reason |
 | `install-daemon.sh` | Stubbed out. Exits without action |
 
 The deprecated path is kept in the repo for forensic value. If anyone is tempted to revisit launchd, the headers explain why it cannot work with the current harness contract.

@@ -48,7 +48,7 @@ claude code session (harness)
 
 ### Why not launchd
 
-We tried. Twice. Both times the agent stopped seeing inbound messages because the harness only fires task notifications on child-process exits, and a launchd-owned process is not a child of the harness. The messages landed in a queue file but the agent had no signal to read it. See the deprecated headers in `scripts/daemon.py` and `LaunchAgents/xyz.aaronstevens.slack-alerts.plist` for the full history.
+We tried. Twice. Both times the agent stopped seeing inbound messages because the harness only fires task notifications on child-process exits, and a launchd-owned process is not a child of the harness. The messages landed in a queue file but the agent had no signal to read it. See the deprecated headers in `scripts/daemon.py` and the LaunchAgents plist for the full history.
 
 The watchdog covers the only failure case the daemon was trying to address: the harness reaps idle background tasks every 2 to 3 minutes with exit 144. The watchdog notices, silently respawns, and the user never sees it.
 
@@ -100,7 +100,7 @@ That is the whole interface. Two phrases.
 First step when you suspect silence:
 
 ```bash
-python3 ~/.claude/skills/0-slack-alerts/scripts/inbox.py health
+python3 ~/.claude/skills/claude-slack-agent/scripts/inbox.py health
 ```
 
 Returns `listener_alive`, `listener_pid`, `thread_ts`, `session_id`, and `state_dir`. If `listener_alive` is `false`, restart the listener via `Bash run_in_background:true` (or just run `agent.sh start` again, which is idempotent).
@@ -124,7 +124,7 @@ For a belt-and-suspenders guard against missed messages, register `scripts/check
       "hooks": [
         {
           "type": "command",
-          "command": "bash ~/.claude/skills/0-slack-alerts/scripts/check-unread-hook.sh",
+          "command": "bash ~/.claude/skills/claude-slack-agent/scripts/check-unread-hook.sh",
           "timeout": 5
         }
       ]
