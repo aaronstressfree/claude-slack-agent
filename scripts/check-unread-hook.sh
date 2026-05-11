@@ -9,8 +9,7 @@
 #      timeout, and parse the JSON.
 #   3. If new_messages > 0, print a system reminder so the harness surfaces
 #      it to Claude before the next prompt is processed.
-#   4. If inbox.py is slow (more than ~3s), emit a brief warning instead of
-#      blocking the turn.
+#   4. If inbox.py is slow (> ~3s), emit a brief warning instead of blocking.
 #
 # Exit code is always 0; this hook never fails a turn.
 
@@ -53,6 +52,7 @@ RESULT="$(run_with_timeout 3 python3 "$SCRIPT_DIR/inbox.py" check 2>/dev/null)"
 RC=$?
 
 if [ $RC -ne 0 ] || [ -z "$RESULT" ]; then
+  # Slow or failed; emit a soft warning instead of blocking.
   echo "Warning: Slack unread check timed out or failed. Run 'python3 $SCRIPT_DIR/inbox.py check' manually if you're expecting messages."
   exit 0
 fi

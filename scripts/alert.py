@@ -1,10 +1,10 @@
 #!/usr/bin/env python3
-"""Slack agent for Claude Code → #agent-aaron channel.
+"""Slack agent for Claude Code: posts to the user's private agent channel.
 
 Message design:
 - Session header: bold title with robot emoji (parent message)
 - Replies: clean text, no prefix clutter. Bot identity is implicit from bot_id.
-- Ack: just "..." — minimal
+- Ack: just "..." (minimal)
 - Alerts: @mention for push notification
 """
 import json
@@ -53,7 +53,7 @@ def _state_dir():
 
 
 def _session_prefix():
-    """Short tag for bot posts so the user can disambiguate concurrent sessions.
+    """Short tag for bot posts so Aaron can disambiguate concurrent sessions.
 
     Returns a string like '[0d24f7] ' (6 chars + brackets + trailing space)
     or '' when no session ID is available.
@@ -90,15 +90,18 @@ def _thread_path():
 
 
 def _load_thread_data():
-    """Load thread.json data dict, checking session-scoped then global paths."""
+    """Load thread.json data dict from this session's scoped state dir.
+
+    Strictly session-scoped: no global fallback. If CLAUDE_SESSION_ID isn't
+    set, _thread_path() points at the global dir but we still only load if
+    the file is actually there for the current invocation. Cross-session
+    bleed is prevented by _is_thread_owner() requiring an owner match.
+    """
+    if not _session_id():
+        return None
     tp = _thread_path()
     if os.path.exists(tp):
         with open(tp) as f:
-            return json.load(f)
-    # Backward compat: check old global session-thread.json
-    global_path = os.path.join(BASE_STATE_DIR, "session-thread.json")
-    if os.path.exists(global_path):
-        with open(global_path) as f:
             return json.load(f)
     return None
 
@@ -111,24 +114,17 @@ def load_thread():
 def _is_thread_owner():
     """Check if the current session owns the active thread.
 
-    Returns True if:
-    - This session created the thread (owner_session matches)
-    - The thread.json lives in this session's scoped dir (not global fallback)
-    Returns False if:
-    - No thread exists
-    - The thread has no owner and caller has no session ID (ambiguous)
-    - The owner doesn't match
+    Strict ownership: requires both a session ID and a matching owner.
+    Ownerless threads are NEVER considered owned. That legacy branch was
+    a magnet for spam from sessions running hooks without CLAUDE_SESSION_ID.
     """
     data = _load_thread_data()
     if not data:
         return False
     owner = data.get("owner_session")
     sid = _session_id()
-    if not owner:
-        # Legacy thread without ownership — only allow if caller also has
-        # no session ID (same ambiguous scope). Prevents random sessions
-        # from hijacking an ownerless thread.
-        return not sid or sid == ""
+    if not sid or not owner:
+        return False
     return owner == sid
 
 

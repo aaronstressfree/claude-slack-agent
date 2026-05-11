@@ -25,19 +25,54 @@ DEFAULT_CONFIG = {
 # --- Shared HTTP helper with retry + backoff ---
 
 _MAX_RETRIES = 3
-_BASE_BACKOFF = 1.0  # seconds
+_BASE_BACKOFF = 2.0  # seconds
+_COOLDOWN_PATH = os.path.join(CONFIG_DIR, "rate_limit_cooldown")
+
+
+def _jitter(base: float) -> float:
+    """Add 0-50% random jitter to avoid thundering herd across sessions."""
+    import random
+    return base * (1 + random.random() * 0.5)
+
+
+def _check_cooldown() -> float:
+    """Check if we're in a rate-limit cooldown. Returns seconds to wait, or 0."""
+    try:
+        if os.path.exists(_COOLDOWN_PATH):
+            with open(_COOLDOWN_PATH) as f:
+                expires = float(f.read().strip())
+            remaining = expires - time.time()
+            if remaining > 0:
+                return remaining
+            os.remove(_COOLDOWN_PATH)
+    except (ValueError, OSError):
+        pass
+    return 0
+
+
+def _set_cooldown(seconds: float):
+    """Set a shared cooldown so other callers don't hammer a rate-limited API."""
+    os.makedirs(CONFIG_DIR, exist_ok=True)
+    with open(_COOLDOWN_PATH, "w") as f:
+        f.write(str(time.time() + seconds))
 
 
 def api_call(req: urllib.request.Request, timeout: int = 10) -> dict:
     """Make a Slack API call with retry logic and timeout.
 
     Handles:
+    - Shared cooldown file: waits if another caller recently hit 429
     - HTTP 429 (rate limited): retries with Retry-After header or exponential backoff
     - URLError / TimeoutError: retries with exponential backoff
-    - Max 3 retries
+    - Max 5 retries with jitter
 
     Returns parsed JSON response dict.
     """
+    # Respect shared cooldown from other callers
+    cooldown = _check_cooldown()
+    if cooldown > 0:
+        time.sleep(cooldown)
+
     last_exc = None
     for attempt in range(_MAX_RETRIES):
         try:
@@ -47,14 +82,16 @@ def api_call(req: urllib.request.Request, timeout: int = 10) -> dict:
             if e.code == 429:
                 retry_after = e.headers.get("Retry-After")
                 wait = float(retry_after) if retry_after else _BASE_BACKOFF * (2 ** attempt)
-                time.sleep(wait)
+                wait = max(wait, 10.0)  # floor at 10s - aggressive retries extend the throttle
+                _set_cooldown(wait + 5)  # extra buffer for other callers
+                time.sleep(_jitter(wait))
                 last_exc = e
                 continue
             # Non-retryable HTTP error
             raise
         except (urllib.error.URLError, TimeoutError, OSError) as e:
             wait = _BASE_BACKOFF * (2 ** attempt)
-            time.sleep(wait)
+            time.sleep(_jitter(wait))
             last_exc = e
             continue
     # Exhausted retries
@@ -66,6 +103,10 @@ def api_call_raw(req: urllib.request.Request, timeout: int = 10) -> bytes:
 
     Same retry logic as api_call but does not parse JSON.
     """
+    cooldown = _check_cooldown()
+    if cooldown > 0:
+        time.sleep(cooldown)
+
     last_exc = None
     for attempt in range(_MAX_RETRIES):
         try:
@@ -75,13 +116,15 @@ def api_call_raw(req: urllib.request.Request, timeout: int = 10) -> bytes:
             if e.code == 429:
                 retry_after = e.headers.get("Retry-After")
                 wait = float(retry_after) if retry_after else _BASE_BACKOFF * (2 ** attempt)
-                time.sleep(wait)
+                wait = max(wait, 5.0)
+                _set_cooldown(wait)
+                time.sleep(_jitter(wait))
                 last_exc = e
                 continue
             raise
         except (urllib.error.URLError, TimeoutError, OSError) as e:
             wait = _BASE_BACKOFF * (2 ** attempt)
-            time.sleep(wait)
+            time.sleep(_jitter(wait))
             last_exc = e
             continue
     raise last_exc
@@ -114,7 +157,7 @@ def get_token(config: dict = None):
 
 
 def setup():
-    """Interactive setup — detect user info from Slack token."""
+    """Interactive setup: detect user info from Slack token."""
     print("Setting up slack-alerts...")
 
     # Check for credentials

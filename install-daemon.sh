@@ -1,7 +1,18 @@
 #!/bin/bash
-# Install the slack-alerts launchd daemon as a user-scoped LaunchAgent.
-# Idempotent: safe to run repeatedly. Unloads the old plist first if present,
-# rewrites with the current $HOME, and loads.
+# DEPRECATED (2026-05-10). Do not run.
+#
+# See scripts/daemon.py and LaunchAgents/xyz.aaronstevens.slack-alerts.plist
+# headers for rationale. Short version: the launchd-owned daemon does not
+# fire the harness's task-completed notification, so the agent never sees
+# inbound messages. The working architecture lives in scripts/listener.sh
+# and scripts/healthcheck.sh, owned by the harness as run_in_background
+# tasks. See README.md.
+#
+# This installer is kept for forensic value only. It exits without action.
+echo "install-daemon.sh is deprecated. The launchd daemon architecture was reverted."
+echo "Use 'bash scripts/agent.sh start \"...\"' to start the working listener model."
+echo "See README.md for the canonical architecture."
+exit 0
 set -euo pipefail
 
 LABEL="xyz.aaronstevens.slack-alerts"

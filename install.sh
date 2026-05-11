@@ -1,13 +1,13 @@
 #!/bin/bash
 # Claude Slack Agent installer
-# Downloads and installs the skill into ~/.claude/skills/slack-agent/
+# Downloads and installs the skill into ~/.claude/skills/0-slack-alerts/
 
 set -e
 
 REPO="aaronstressfree/claude-slack-agent"
 BRANCH="main"
 BASE_URL="https://raw.githubusercontent.com/${REPO}/${BRANCH}"
-DEST="$HOME/.claude/skills/slack-agent"
+DEST="$HOME/.claude/skills/0-slack-alerts"
 
 echo ""
 echo "  Installing Claude Slack Agent..."
@@ -17,12 +17,12 @@ echo ""
 mkdir -p "${DEST}/scripts"
 
 # Download top-level files
-for file in SKILL.md INSTALL.md; do
+for file in SKILL.md INSTALL.md README.md; do
   curl -sL "${BASE_URL}/${file}" -o "${DEST}/${file}"
 done
 
-# Download scripts
-for file in agent.sh alert.py config.py inbox.py listener.sh run.sh; do
+# Download scripts (the canonical, working set)
+for file in agent.sh alert.py config.py inbox.py listener.sh healthcheck.sh heartbeat.sh check-unread-hook.sh run.sh; do
   curl -sL "${BASE_URL}/scripts/${file}" -o "${DEST}/scripts/${file}"
 done
 

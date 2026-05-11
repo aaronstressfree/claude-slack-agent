@@ -8,34 +8,60 @@ When you are working in Claude Code and want to stay in touch without staring at
 
 1. **Say "start slack agent"** at the beginning of a session. Claude creates a new thread in your private Slack channel.
 2. **Reply in the thread** to send instructions, ask questions, or redirect Claude mid-task.
-3. **Claude shows you what is happening.** A `:loading_:` spinner means it is reading your message, a robot emoji marks its replies, and a `--- --- ---` divider separates each response so the thread stays easy to scan.
+3. **Claude shows you what is happening.** A `:loading_:` spinner means it is reading your message, a robot emoji marks its replies, and a `─ ─ ─` divider separates each response so the thread stays easy to scan.
 4. **Say "stop slack agent"** when you are done. It closes the thread and frees things up.
 
 You can run multiple Claude Code sessions at the same time. Each one gets its own thread, so nothing crosses wires.
 
 While the agent is running, it keeps your Mac awake so polling does not get interrupted.
 
-## Architecture (2026-05-10 rewrite)
+## Architecture
 
-The poll loop runs in a **launchd-owned daemon**, not in a Claude Code background task. This survives harness reaps, agent dispatches, idle periods, Mac sleep/wake, and reboots (relaunches at next login).
+The polling listener runs as a **foreground child of the Claude Code harness**, not a detached daemon. This is the load-bearing detail: the harness fires a "task completed" notification to the agent only when a child process spawned via `Bash run_in_background:true` exits. The agent reads that exit's stdout and uses it as the trigger for the next turn. A detached daemon (launchd, nohup, double-fork) writes to a file but the agent never sees the signal.
+
+So the contract is:
+
+1. `listener.sh` polls Slack on a 6-second loop.
+2. On new messages, it posts a one-time-per-batch `:mag: Looking into it...` ack, prints the message JSON to stdout, and exits cleanly.
+3. The harness fires the task-completed notification to the agent.
+4. The agent reads stdout, calls `inbox.py reply "..."` to post a response, then explicitly restarts `listener.sh` via a fresh `Bash run_in_background:true` call.
+5. A silent `healthcheck.sh` watchdog (also harness-owned) respawns the listener if it dies between cycles. The watchdog stays quiet on isolated failures and only posts a single `:warning:` after three consecutive respawn failures, so a normal harness reap creates no Slack noise.
 
 ```
-launchd
-  └─ python3 daemon.py  (every 3s)
-       └─ for each ~/.config/slack-alerts/sessions/<id>/ with thread.json:
-            └─ fetch new Slack replies > daemon_cursor
-                 └─ append to <id>/inbox-queue.jsonl
-
-claude code session
-  ├─ agent.sh start "..."  → ensures daemon is loaded, creates thread
-  ├─ inbox.py check         → reads queue (no Slack round-trip)
-  ├─ inbox.py reply "..."   → posts to Slack, advances queue consume cursor
-  └─ agent.sh stop          → touches session.ended marker, daemon skips it
+claude code session (harness)
+  ├─ agent.sh start "title"
+  │    ├─ alert.py start "title"       (creates thread.json)
+  │    ├─ caffeinate                   (keeps Mac awake)
+  │    ├─ nohup listener.sh &          (spawns initial listener)
+  │    └─ nohup healthcheck.sh &       (spawns silent watchdog)
+  │
+  ├─ listener.sh (run_in_background)
+  │    └─ on new messages: ack once, print JSON, exit 0
+  │
+  ├─ agent reads stdout, calls inbox.py reply "..."
+  ├─ agent restarts listener.sh via fresh Bash run_in_background
+  │
+  └─ agent.sh stop
+       ├─ kill listener, healthcheck, heartbeat, caffeinate
+       └─ alert.py end                 (posts _Session ended._)
 ```
+
+### Why not launchd
+
+We tried. Twice. Both times the agent stopped seeing inbound messages because the harness only fires task notifications on child-process exits, and a launchd-owned process is not a child of the harness. The messages landed in a queue file but the agent had no signal to read it. See the deprecated headers in `scripts/daemon.py` and `LaunchAgents/xyz.aaronstevens.slack-alerts.plist` for the full history.
+
+The watchdog covers the only failure case the daemon was trying to address: the harness reaps idle background tasks every 2 to 3 minutes with exit 144. The watchdog notices, silently respawns, and the user never sees it.
+
+### Invariants
+
+- **One listener per session.** `listener.sh` claims `$STATE_DIR/listener.pid` on startup. A second invocation while one is alive exits silently (rc 0). Spam-calling 100 times produces exactly one process.
+- **One-time-per-batch ack.** `listener.sh` only posts `:mag: Looking into it...` when the highest message ts in the current batch is newer than `$STATE_DIR/last_acked_ts`. A respawned listener finding the same queued messages does not re-ack.
+- **Strict session isolation.** Every script requires `CLAUDE_SESSION_ID` and refuses to operate on global state. Each session has its own `~/.config/slack-alerts/sessions/<id>/` dir with its own thread, cursor, queue, and PID files.
+- **Session prefix in posts.** Every bot message starts with `[abc123] ` (the first 6 chars of the session ID) so multiple concurrent sessions are visually distinguishable in the channel.
 
 ## Prerequisites
 
-You will need the Block Slack skill installed (`sq agents skills add slack`). The setup will check for this and guide you if it is missing.
+You will need the Block Slack skill installed (`sq agents skills add slack`) or equivalent Slack credentials at `~/.config/slack-skill/credentials.json`. The setup flow checks for this and guides you if it is missing.
 
 ## Install
 
@@ -45,22 +71,7 @@ Open Claude Code and paste this one line:
 curl -sL https://raw.githubusercontent.com/aaronstressfree/claude-slack-agent/main/install.sh | bash
 ```
 
-Then install the launchd daemon (one time only):
-
-```
-bash ~/.claude/skills/0-slack-alerts/install-daemon.sh
-```
-
-The daemon now starts at every login automatically.
-
-## Daemon management
-
-| Command | Purpose |
-|---------|---------|
-| `launchctl list \| grep slack-alerts` | Status |
-| `launchctl unload ~/Library/LaunchAgents/xyz.aaronstevens.slack-alerts.plist` | Stop |
-| `bash ~/.claude/skills/0-slack-alerts/install-daemon.sh` | (Re)load |
-| `tail -f ~/.config/slack-alerts/daemon.log` | Logs |
+That is the whole install. There is no launchd daemon to set up.
 
 ## What happens after install
 
@@ -77,24 +88,30 @@ No config files to edit. No environment variables. Just a conversation.
 
 | Say this in Claude Code | What happens |
 |---|---|
-| **start slack agent** | Ensures daemon loaded, creates a thread, listens for replies |
-| **stop slack agent** | Marks session ended, closes the thread |
+| **start slack agent** | Creates a thread, spawns listener and watchdog, starts caffeinate |
+| **stop slack agent** | Kills child processes, posts `_Session ended._`, clears PID files |
 
 That is the whole interface. Two phrases.
 
-**Important:** The agent does not auto-start a session. Every time you open Claude Code and want Slack access, say "start slack agent". When you are done, say "stop slack agent" to keep things clean and let Claude know you are finished. The daemon itself stays loaded across all of this.
+**Important:** The agent does not auto-start a session. Every time you open Claude Code and want Slack access, say "start slack agent". When you are done, say "stop slack agent" to keep things clean.
 
-## Reliability
+## Debugging
 
-The new model is structurally bulletproof against the old failure modes:
+First step when you suspect silence:
 
-1. **No harness lifecycle.** The daemon is owned by launchd. Claude Code starting, stopping, restarting, dispatching subagents, or being idle has zero effect.
-2. **KeepAlive.** If the daemon crashes, launchd relaunches it within `ThrottleInterval` seconds (10s in the plist).
-3. **No respawn warnings.** The old `:warning: Listener died` channel noise is gone. The daemon does not die in normal operation, and even if it does, launchd recovers silently.
-4. **Per-session queues.** Each Claude Code session has its own state dir and queue file. Cross-session bleed is structurally impossible.
-5. **Session prefix.** Every bot post includes a short `[abc123]` prefix so you can visually disambiguate concurrent sessions in the channel.
+```bash
+python3 ~/.claude/skills/0-slack-alerts/scripts/inbox.py health
+```
 
-First debug step if you suspect a problem: `python3 ~/.claude/skills/0-slack-alerts/scripts/inbox.py health`. Returns `daemon_alive`, `daemon_pid`, `queue_unread`, `thread_ts`, etc.
+Returns `listener_alive`, `listener_pid`, `thread_ts`, `session_id`, and `state_dir`. If `listener_alive` is `false`, restart the listener via `Bash run_in_background:true` (or just run `agent.sh start` again, which is idempotent).
+
+Logs live at:
+
+- `$STATE_DIR/listener.log` (listener output and errors)
+- `$STATE_DIR/healthcheck.log` (watchdog activity)
+- `$STATE_DIR/heartbeat.log` (optional status poster)
+
+where `$STATE_DIR` is `~/.config/slack-alerts/sessions/<CLAUDE_SESSION_ID>/`.
 
 ## Optional: UserPromptSubmit safety net
 
@@ -116,4 +133,21 @@ For a belt-and-suspenders guard against missed messages, register `scripts/check
 }
 ```
 
-On every user prompt, the hook reads the local queue file. If there are unread messages, it surfaces a warning to Claude before the turn runs so Claude reads and replies before doing anything else. The hook is silent when no Slack session is active and times out gracefully if the queue read is slow.
+On every user prompt, the hook checks for unread messages and surfaces a warning to Claude before the turn runs so Claude reads and replies before doing anything else. The hook is silent when no Slack session is active and times out gracefully if the Slack API is slow.
+
+## Files
+
+| File | Purpose |
+|---|---|
+| `scripts/agent.sh` | Session lifecycle: `start <title>`, `stop`, `status [text]` |
+| `scripts/listener.sh` | Foreground poll loop. Exits on new messages |
+| `scripts/healthcheck.sh` | Silent watchdog. Respawns dead listeners |
+| `scripts/inbox.py` | `check`, `reply`, `health` |
+| `scripts/alert.py` | `start`, `post`, `alert`, `ack`, `end`, `image` |
+| `scripts/heartbeat.sh` | Optional status-line poster |
+| `scripts/check-unread-hook.sh` | Optional UserPromptSubmit safety net |
+| `scripts/config.py` | Interactive setup and shared Slack API helper |
+| `scripts/run.sh` | Wraps long commands with auto post/done/failed updates |
+| `scripts/daemon.py` | **DEPRECATED.** Launchd architecture. Do not use |
+| `LaunchAgents/*.plist` | **DEPRECATED.** Launchd plist. Do not load |
+| `install-daemon.sh` | **DEPRECATED.** Launchd installer. Stubbed out |

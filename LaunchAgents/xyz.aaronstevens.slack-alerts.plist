@@ -1,4 +1,18 @@
 <?xml version="1.0" encoding="UTF-8"?>
+<!--
+  DEPRECATED (2026-05-10). Do not load this plist.
+
+  See scripts/daemon.py header for the full rationale. Short version: a
+  launchd-detached daemon does not fire the harness's "task completed"
+  notification, so the agent never sees inbound messages even though they
+  land in the queue. The working architecture is a foreground listener.sh
+  child of the harness with a silent watchdog. See README.md.
+
+  Kept in the repo for forensic value. If you somehow loaded it, unload:
+
+    launchctl unload ~/Library/LaunchAgents/xyz.aaronstevens.slack-alerts.plist
+    rm ~/Library/LaunchAgents/xyz.aaronstevens.slack-alerts.plist
+-->
 <!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
 <plist version="1.0">
 <dict>

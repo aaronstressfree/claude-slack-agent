@@ -1,30 +1,31 @@
 #!/usr/bin/env python3
-"""Persistent Slack polling daemon.
+"""DEPRECATED (2026-05-10). Do not use.
 
-Architecture:
-- Owned by launchd, not the Claude Code harness. Survives harness reaps,
-  agent dispatches, idle periods, computer sleep/wake.
-- Walks ~/.config/slack-alerts/sessions/* every POLL_INTERVAL seconds.
-- For each session with thread.json present and no session.ended marker,
-  fetches Slack replies > daemon_cursor and appends each new human message
-  to inbox-queue.jsonl in that session's state dir.
-- inbox.py check reads the queue (instant, no Slack round-trip).
-- inbox.py reply still posts to Slack directly and advances the queue
-  consume cursor so the daemon's next poll naturally skips its own echo.
+Kept in the repo for historical and forensic value only. The launchd-owned
+daemon architecture was an attempt to escape harness reaps that ended up
+breaking the harness contract more severely than the bug it was trying to
+fix.
 
-Cursors:
-- daemon_cursor.json: highest Slack ts the daemon has appended for this
-  session. The daemon never goes backward; this is the watermark used as
-  `oldest` on the next conversations.replies fetch.
-- queue_cursor.json: highest Slack ts the consumer (inbox.py check) has
-  drained. Messages between queue_cursor and end-of-file are unread.
+Why it failed:
+The Claude Code harness fires a "task completed" notification to the agent
+only when a child process spawned via `Bash run_in_background:true` exits.
+The agent then reads the captured stdout from that exit as the trigger for
+the next turn. A launchd-detached daemon writing to a queue file does NOT
+fire that notification, so the agent has no signal that a new message
+arrived. The result was that messages landed in the queue but the agent
+never noticed until the next manual `inbox.py check`.
 
-Why both:
-- The daemon doesn't care whether the agent has read the messages; it just
-  needs to know what it's already written so it doesn't double-append.
-- The consumer doesn't care what's on Slack; it just walks its local queue.
+The working architecture (see listener.sh + healthcheck.sh + inbox.py +
+agent.sh) keeps the listener as a foreground child of the harness, so its
+exit-with-messages drives the next turn. A separate silent watchdog
+respawns the listener if the harness reaps it. See README.md for the full
+contract.
 
-No new pypi deps. urllib + stdlib only.
+Do not load the LaunchAgent plist. Do not run this file. If you find it
+running, unload it:
+
+    launchctl unload ~/Library/LaunchAgents/xyz.aaronstevens.slack-alerts.plist
+    rm ~/Library/LaunchAgents/xyz.aaronstevens.slack-alerts.plist
 """
 import json
 import os

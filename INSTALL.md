@@ -55,7 +55,7 @@ cat ~/.config/slack-skill/credentials.json 2>/dev/null | python3 -c "import sys,
 Run the detect command to get the user's Slack identity:
 
 ```bash
-python3 ~/.claude/skills/slack-agent/scripts/config.py detect
+python3 ~/.claude/skills/0-slack-alerts/scripts/config.py detect
 ```
 
 Tell the user what you found in plain language, like: "Looks like you're **@aaron** on the **Acme** workspace."
@@ -90,13 +90,13 @@ Ask the user:
 Run the setup command with their choices. For example, for a private channel named "agent-aaron":
 
 ```bash
-python3 ~/.claude/skills/slack-agent/scripts/config.py setup --channel agent-aaron
+python3 ~/.claude/skills/0-slack-alerts/scripts/config.py setup --channel agent-aaron
 ```
 
 For a public channel:
 
 ```bash
-python3 ~/.claude/skills/slack-agent/scripts/config.py setup --channel agent-aaron --public
+python3 ~/.claude/skills/0-slack-alerts/scripts/config.py setup --channel agent-aaron --public
 ```
 
 If setup succeeds, continue. If it fails, help the user troubleshoot in plain language.
@@ -124,5 +124,5 @@ Ask the user:
 
 > Want to give it a spin right now? I can send a test message to your Slack channel so you can see it in action.
 
-- If yes: run `bash ~/.claude/skills/slack-agent/scripts/agent.sh start "Test session"` and start the listener with `bash ~/.claude/skills/slack-agent/scripts/listener.sh` (run_in_background: true). Tell them to check Slack for the new thread, and try replying to it.
+- If yes: run `bash ~/.claude/skills/0-slack-alerts/scripts/agent.sh start "Test session"` and start the listener with `bash ~/.claude/skills/0-slack-alerts/scripts/listener.sh` (run_in_background: true). Tell them to check Slack for the new thread, and try replying to it.
 - If no: say "No worries! Just say 'start slack agent' whenever you're ready."
