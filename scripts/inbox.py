@@ -1,16 +1,24 @@
 #!/usr/bin/env python3
 """Read and reply to Aaron's messages in the session thread.
 
+ARCHITECTURE NOTE (2026-05-10):
+The harness-owned listener.sh is DEPRECATED. The launchd-owned daemon.py
+polls Slack and writes messages to a local queue file. `check` reads the
+queue (no Slack round-trip). `reply` still posts to Slack and advances
+the queue consume cursor so the daemon's next poll naturally skips the
+echo.
+
 Commands:
-  check            Check for new messages (non-destructive)
-  check --advance  Check for new messages and advance cursor
-  reply <msg>      Reply and advance cursor; auto-respawns listener.sh
+  check            Check for new messages (non-destructive; reads queue)
+  check --advance  Check + advance consume cursor past all queued
+  reply <msg>      Reply, advance consume cursor (no listener respawn)
   reply --no-respawn <msg>
-                   Reply without auto-respawning the listener (use on shutdown)
+                   Back-compat alias for reply (respawn no longer applies)
+  reply --dry-run  Show what would be posted, do not call Slack
+  health           Report queue state, daemon status, thread info
 """
 import json
 import os
-import subprocess
 import sys
 import tempfile
 import time
@@ -19,14 +27,14 @@ import urllib.parse
 from pathlib import Path
 
 SCRIPT_DIR = os.path.dirname(os.path.abspath(__file__))
-LISTENER_PATH = os.path.join(SCRIPT_DIR, "listener.sh")
 
 # Import shared API helper from config.py
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
-from config import api_call
+from config import api_call  # noqa: E402
 
 CONFIG_PATH = os.path.expanduser("~/.config/slack-alerts/config.json")
 BASE_STATE_DIR = os.path.expanduser("~/.config/slack-alerts")
+DAEMON_PID_PATH = os.path.join(BASE_STATE_DIR, "daemon.pid")
 
 
 def _load_cfg():
@@ -39,14 +47,6 @@ def _load_cfg():
 
 
 def _session_id():
-    """Get session ID, falling back to Claude Code's PID via grandparent resolution.
-
-    Process chain: Claude Code (PID X) → bash → python3 this_script.py
-    - Bash's PPID = X (Claude Code)
-    - Python's ppid = bash PID
-    - Python's grandparent = X (Claude Code)
-    All scripts from the same Claude Code session resolve to the same X.
-    """
     sid = os.environ.get("CLAUDE_SESSION_ID", "")
     if sid:
         return sid
@@ -63,12 +63,7 @@ def _state_dir():
 
 
 def _session_prefix():
-    """Short tag for bot posts so Aaron can disambiguate concurrent sessions.
-
-    Returns a string like '[0d24f7] ' (6 chars + brackets + trailing space)
-    or '' when no session ID is available. Keep it cheap and stable so it
-    doesn't churn across messages in the same thread.
-    """
+    """Short tag for bot posts so Aaron can disambiguate concurrent sessions."""
     sid = _session_id()
     if not sid:
         return ""
@@ -84,13 +79,13 @@ def _load_creds():
     with open(_CFG["creds_path"]) as f:
         return json.load(f)
 
+
 def get_token():
     return _load_creds()["token"]
 
+
 def get_post_token():
-    """Get the best token for posting messages.
-    Prefers bot_token (posts as bot identity) over user token (posts as user).
-    """
+    """Prefer bot_token (posts as bot identity) over user token."""
     creds = _load_creds()
     return creds.get("bot_token", creds["token"])
 
@@ -98,6 +93,11 @@ def get_post_token():
 def _thread_path():
     sd = _state_dir()
     return os.path.join(sd, "thread.json") if sd else None
+
+
+def _queue_path():
+    sd = _state_dir()
+    return os.path.join(sd, "inbox-queue.jsonl") if sd else None
 
 
 def _cursor_path():
@@ -119,6 +119,7 @@ def _cursor_key():
 
 
 def load_cursor():
+    """Load the consume cursor: highest queue ts the agent has acknowledged."""
     cp = _cursor_path()
     if cp and Path(cp).exists():
         with open(cp) as f:
@@ -127,14 +128,7 @@ def load_cursor():
 
 
 def save_cursor(ts: str):
-    """Write the cursor atomically: tmp file in the same dir, then rename.
-
-    Atomic write prevents a partial-write race if two processes try to
-    update the cursor simultaneously (defense in depth alongside the
-    single-listener invariant). Rename within the same filesystem is
-    atomic on POSIX, so readers either see the old cursor or the new one,
-    never a half-written file.
-    """
+    """Atomic write of the consume cursor."""
     cp = _cursor_path()
     sd = _state_dir()
     if not cp or not sd:
@@ -154,83 +148,56 @@ def save_cursor(ts: str):
             json.dump(data, f)
         os.replace(tmp_path, cp)
     except OSError:
-        # Best-effort cleanup; do not raise (a missed cursor advance is
-        # recoverable, but a thrown exception would lose the reply.)
         try:
             os.unlink(tmp_path)
         except OSError:
             pass
 
 
-def fetch_thread_replies(since: str):
-    """Fetch replies in the session thread newer than `since`."""
-    token = get_token()
-    thread_ts = load_thread()
-    if not thread_ts:
-        return {"ok": False, "error": "no session thread"}
+def _read_queue_messages(since: str):
+    """Read the local queue file, return messages with ts > since.
 
-    params = urllib.parse.urlencode({
-        "channel": CHANNEL,
-        "ts": thread_ts,
-        "oldest": since,
-        "inclusive": "false",
-        "limit": "50",
-    })
-    req = urllib.request.Request(
-        f"https://slack.com/api/conversations.replies?{params}",
-        headers={"Authorization": f"Bearer {token}", "Content-Type": "application/json; charset=utf-8"},
-    )
-    return api_call(req)
-
-
-def get_human_messages(since: str):
-    """Get Aaron's messages (no bot_id, no subtype) newer than `since`."""
-    thread_ts = load_thread()
-    result = fetch_thread_replies(since)
-    if not result.get("ok"):
+    Queue is append-only JSONL. Each line is {"ts": "...", "text": "..."}.
+    Malformed lines are skipped (defensive: don't crash on partial writes).
+    """
+    qp = _queue_path()
+    if not qp or not os.path.exists(qp):
         return [], since
-
     messages = []
     latest = since
-    for msg in result.get("messages", []):
-        # Skip bot messages, subtypes, and the parent message
-        if msg.get("bot_id") or msg.get("subtype"):
-            continue
-        if msg.get("user") != USER_ID:
-            continue
-        if msg["ts"] <= since:
-            continue
-        if thread_ts and msg["ts"] == thread_ts:
-            continue
-        # Skip our own messages posted with user token (no bot_id).
-        # Bot messages always start with :robot_face: or :loading_: prefix,
-        # optionally preceded by a session prefix like "[abc123] ".
-        text = msg.get("text", "")
-        stripped = text
-        if stripped.startswith("[") and "] " in stripped[:12]:
-            stripped = stripped.split("] ", 1)[1]
-        if stripped.startswith(":robot_face:") or stripped.startswith(":loading_:") or stripped.startswith("_Session ended"):
-            continue
-        messages.append({"ts": msg["ts"], "text": text})
-        if msg["ts"] > latest:
-            latest = msg["ts"]
-
+    with open(qp) as f:
+        for line in f:
+            line = line.strip()
+            if not line:
+                continue
+            try:
+                msg = json.loads(line)
+            except json.JSONDecodeError:
+                continue
+            ts = msg.get("ts")
+            if not ts or ts <= since:
+                continue
+            messages.append({"ts": ts, "text": msg.get("text", "")})
+            if ts > latest:
+                latest = ts
     return messages, latest
 
 
 def get_recent_context(limit: int = 5):
     """Get the last N messages from the thread (both human and bot) for context.
-    Uses latest=true to fetch only the most recent messages, not all of them."""
+
+    Still pulls from Slack so bot context (the agent's own replies) is included.
+    The queue only has human messages.
+    """
     thread_ts = load_thread()
     if not thread_ts:
         return []
 
-    # Fetch only the latest messages instead of all since "0"
     token = get_token()
     params = urllib.parse.urlencode({
         "channel": CHANNEL,
         "ts": thread_ts,
-        "limit": str(limit * 3),  # Fetch extra to account for skipped messages
+        "limit": str(limit * 3),
         "inclusive": "false",
         "latest": "999999999999.999999",
     })
@@ -241,40 +208,33 @@ def get_recent_context(limit: int = 5):
     try:
         result = api_call(req)
     except Exception:
-        return []  # Gracefully degrade; context is nice-to-have, not critical
+        return []
     if not result.get("ok"):
         return []
 
     context = []
     for msg in result.get("messages", []):
-        # Skip the parent message and subtypes
         if msg["ts"] == thread_ts:
             continue
         if msg.get("subtype"):
             continue
         text = msg.get("text", "")
-        # Skip ack messages
         if text.strip() in ("...", ":loading_:"):
             continue
-        # Identify agent messages by bot_id OR :robot_face: prefix (user token fallback).
-        # Strip a possible session prefix like "[abc123] " before checking.
         stripped = text
         if stripped.startswith("[") and "] " in stripped[:12]:
             stripped = stripped.split("] ", 1)[1]
         is_agent = bool(msg.get("bot_id")) or stripped.startswith(":robot_face:")
         who = "agent" if is_agent else "aaron"
         context.append({"who": who, "text": text})
-
-    # Return last N
     return context[-limit:]
 
 
 def cmd_check(advance: bool = False):
-    """Check for new messages. Optionally advance cursor."""
+    """Check for new messages from the local queue. Optionally advance cursor."""
     cursor = load_cursor()
-    messages, latest = get_human_messages(cursor)
+    messages, latest = _read_queue_messages(cursor)
 
-    # Advance cursor if requested and there are new messages
     if advance and latest > cursor:
         save_cursor(latest)
 
@@ -284,105 +244,41 @@ def cmd_check(advance: bool = False):
         "thread_ts": load_thread(),
         "new_messages": len(messages),
         "messages": messages,
+        "source": "queue",
     }
-    # Only fetch recent context when there are new messages (saves an API call per poll)
     if messages:
         result["recent_context"] = get_recent_context()
 
     print(json.dumps(result, indent=2))
 
 
-def _listener_alive():
-    """Return True if the session's listener PID file points to a live process.
-
-    Used by `_spawn_listener` to verify a respawn actually took, and by
-    `cmd_health` so external callers can confirm the inbound channel.
-    """
-    sd = _state_dir()
-    if not sd:
+def _daemon_alive():
+    """Best-effort: is the launchd daemon currently running?"""
+    if not os.path.exists(DAEMON_PID_PATH):
         return False
-    pidfile = os.path.join(sd, "listener.pid")
     try:
-        with open(pidfile) as f:
+        with open(DAEMON_PID_PATH) as f:
             pid = int(f.read().strip())
-    except (FileNotFoundError, ValueError, OSError):
-        return False
-    if pid <= 0:
-        return False
-    try:
         os.kill(pid, 0)
-    except (ProcessLookupError, PermissionError):
-        return False
-    except OSError:
-        return False
-    return True
-
-
-def _spawn_listener():
-    """Spawn a detached background listener process, then self-test.
-
-    listener.sh enforces the single-listener invariant via its own PID file:
-    a second spawn while one is already alive becomes a silent no-op. So
-    "did the spawn take" is really "is *some* listener alive after we
-    spawned" not "did our specific child survive". We retry once if the
-    PID file is missing after 0.5s, then once more after a longer wait,
-    then give up and report `false` so the caller surfaces the failure.
-    """
-    sd = _state_dir()
-    if not sd:
-        return False
-    os.makedirs(sd, exist_ok=True)
-    log_path = os.path.join(sd, "listener.log")
-
-    def _spawn_once():
-        try:
-            log_fp = open(log_path, "a")
-            subprocess.Popen(
-                ["bash", LISTENER_PATH],
-                stdout=log_fp,
-                stderr=subprocess.STDOUT,
-                stdin=subprocess.DEVNULL,
-                start_new_session=True,
-                close_fds=True,
-            )
-            return True
-        except Exception:
-            return False
-
-    if not _spawn_once():
-        return False
-    time.sleep(0.5)
-    if _listener_alive():
         return True
-
-    # Retry once. The first spawn may have lost a race with another spawn
-    # call that already cleaned its PID file mid-flight.
-    if not _spawn_once():
+    except (FileNotFoundError, ValueError, OSError, ProcessLookupError, PermissionError):
         return False
-    time.sleep(0.8)
-    return _listener_alive()
 
 
 def cmd_reply(message: str, respawn: bool = True, dry_run: bool = False):
-    """Reply in thread and advance cursor past all current messages.
+    """Reply in thread and advance consume cursor past all queued messages.
 
-    When respawn is True (the default), spawn a fresh background listener
-    after the reply succeeds and verify it actually came up. The result
-    includes `listener_respawned`, which is now grounded in a PID-file
-    check (was a blind `true` previously).
-
-    `dry_run=True` skips the Slack post but still exercises the respawn
-    path. Useful for tests.
+    The `respawn` parameter is preserved for backward-compat with existing
+    callers but no longer spawns a listener. The launchd daemon does the
+    polling now. The flag is ignored.
     """
     if dry_run:
-        respawned = _spawn_listener() if respawn else False
         text = f"{_session_prefix()}:robot_face: {message}\n─ ─ ─"
         print(json.dumps({
             "ok": True,
             "dry_run": True,
             "would_post": text,
-            "listener_respawned": respawned,
-            "listener_alive": _listener_alive(),
+            "daemon_alive": _daemon_alive(),
         }, indent=2))
         return
 
@@ -401,44 +297,50 @@ def cmd_reply(message: str, respawn: bool = True, dry_run: bool = False):
     )
     result = api_call(req)
 
-    # Use the reply's timestamp as cursor; anything before our reply is "seen"
-    if result.get("ok") and result.get("message", {}).get("ts"):
-        save_cursor(result["message"]["ts"])
-
-    respawned = False
-    if respawn and result.get("ok"):
-        respawned = _spawn_listener()
+    # Advance consume cursor: agent has now responded, so everything queued
+    # up through "now" is acknowledged. Use the highest queued ts as cursor,
+    # not the reply ts (the reply isn't in our queue, only human messages are).
+    _, latest_queued = _read_queue_messages(load_cursor())
+    if latest_queued > load_cursor():
+        save_cursor(latest_queued)
 
     print(json.dumps({
         "ok": result.get("ok", False),
-        "listener_respawned": respawned,
-        "listener_alive": _listener_alive(),
+        "daemon_alive": _daemon_alive(),
+        # Back-compat: callers still inspect listener_respawned / listener_alive.
+        # The daemon replaces both, so we map both to daemon health.
+        "listener_respawned": _daemon_alive(),
+        "listener_alive": _daemon_alive(),
     }, indent=2))
 
 
 def cmd_health():
-    """Report listener liveness and session state. Read-only.
-
-    Used by the watchdog (healthcheck.sh) and by Aaron when he wants to
-    confirm the bot is alive without restarting anything.
-    """
+    """Report daemon liveness, queue depth, thread, and session state. Read-only."""
     sd = _state_dir()
-    alive = _listener_alive()
-    pid = None
-    if sd:
-        pidfile = os.path.join(sd, "listener.pid")
+    daemon_alive = _daemon_alive()
+    daemon_pid = None
+    if os.path.exists(DAEMON_PID_PATH):
         try:
-            with open(pidfile) as f:
-                pid = int(f.read().strip())
-        except (FileNotFoundError, ValueError, OSError):
-            pid = None
+            with open(DAEMON_PID_PATH) as f:
+                daemon_pid = int(f.read().strip())
+        except (ValueError, OSError):
+            daemon_pid = None
+
+    cursor = load_cursor()
+    unread, _ = _read_queue_messages(cursor)
+
     print(json.dumps({
         "ok": True,
         "session_id": _session_id() or None,
         "state_dir": sd,
         "thread_ts": load_thread(),
-        "listener_alive": alive,
-        "listener_pid": pid,
+        "daemon_alive": daemon_alive,
+        "daemon_pid": daemon_pid,
+        "queue_unread": len(unread),
+        "consume_cursor": cursor,
+        # Back-compat keys (now reflect daemon state, not the dead listener).
+        "listener_alive": daemon_alive,
+        "listener_pid": daemon_pid,
     }, indent=2))
 
 
