@@ -61,7 +61,19 @@ The watchdog covers the only failure case the daemon was trying to address: the 
 
 ## Prerequisites
 
-You will need the Block Slack skill installed (`sq agents skills add slack`) or equivalent Slack credentials at `~/.config/slack-skill/credentials.json`. The setup flow checks for this and guides you if it is missing.
+You will need a **raw Slack user OAuth token** (`xoxp-...`) saved to `~/.config/slack-skill/credentials.json` as `{"token": "xoxp-..."}`. The agent reads that token directly off disk and calls Slack's REST API itself; it does NOT route through gateway tools like `sq agent-tools slack`.
+
+The OAuth grant on that token needs `files:write` alongside the usual read/write scopes. Without `files:write`, screenshot posting silently fails. The full required scope list is in [INSTALL.md](INSTALL.md) Step 2.
+
+### Enterprise gotcha
+
+At many enterprises (Block included), installing a custom Slack app to mint that token gets blocked by a security review because `files:write` is on the "High Risk" scope list. In that environment you have three options, in order of preference:
+
+1. Check whether your org already has an internally-blessed raw token mechanism that wrote credentials to `~/.config/slack-skill/credentials.json` for you. If yes, you're done.
+2. Get the custom-app install approved on a one-off basis, or borrow a token from an admin-installed shared internal Slack app.
+3. Use the agent without image support, by disabling `cmd_image` in `scripts/alert.py`.
+
+Gateway-mediated paths (`sq agent-tools slack`, kgoose proxies, similar) will let you post and read messages but generally cannot do file uploads, because the gateway doesn't expose Slack's `files.*` endpoints. The setup flow does NOT detect this for you; you'll see message posts succeed and screenshot posts silently fail.
 
 ## Install
 

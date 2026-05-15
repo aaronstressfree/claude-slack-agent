@@ -18,17 +18,43 @@ Say to the user:
 
 ## Step 2: Check for Slack credentials
 
-Check if Slack credentials are installed:
+This agent talks to Slack with a **raw user OAuth token** (`xoxp-...`) that it reads directly from disk and uses to call Slack's REST API. It does NOT route through gateway tools like `sq agent-tools slack` or other kgoose-mediated proxies, because those gateways generally don't expose Slack's file-upload endpoints (`files.getUploadURLExternal` / `files.completeUploadExternal`), and the agent posts screenshots routinely.
+
+So before going further, the credentials file at `~/.config/slack-skill/credentials.json` needs to contain a token that satisfies both:
+1. It is an `xoxp-...` user OAuth token (NOT a `xoxb-...` bot token, NOT a gateway handle).
+2. The OAuth grant includes `files:write` alongside the read/write scopes the agent needs.
+
+Check whether the file is already in place:
 
 ```bash
 test -f ~/.config/slack-skill/credentials.json && echo "installed" || echo "missing"
 ```
 
 - If the file exists, continue to Step 3.
-- If the file is missing, say:
-  > You'll need Slack credentials at `~/.config/slack-skill/credentials.json`. Create a Slack app at api.slack.com with `chat:write`, `channels:history`, `channels:read`, `groups:history`, `groups:read`, `im:history`, `users:read`, and (optional) `files:write` scopes, install it to your workspace, then save the user OAuth token to that file as JSON `{"token": "xoxp-..."}`. Come back and say **"set up slack agent"** again once it's there.
+- If the file is missing, walk the user through one of the three paths below in order of preference, then stop until they come back.
 
-  Then stop here.
+### Path A: existing internally-blessed raw token (recommended at enterprises)
+
+Some orgs ship internal Slack tooling that has already done an OAuth flow against an admin-installed Slack app and dropped a raw `xoxp` token on the user's machine. At Block, the legacy `slack-skill` setup did this back in early 2026. If a path like that exists in the user's environment, that token is already approved for `files:write` and the user doesn't need to install anything new.
+
+How to find out: ask the user whether their org has an internal "raw Slack token" mechanism, or check for a token at `~/.config/slack-skill/credentials.json` left behind by older tooling. If yes, this step is done.
+
+### Path B: personal Slack app install (non-enterprise / no review process)
+
+If the user can freely install Slack apps at api.slack.com:
+
+> Create a Slack app at api.slack.com with these user-scoped OAuth scopes: `chat:write`, `channels:history`, `channels:read`, `groups:history`, `groups:read`, `im:history`, `im:write`, `users:read`, and `files:write`. Install it to your workspace, copy the user OAuth token (starts with `xoxp-`), and save it to `~/.config/slack-skill/credentials.json` as JSON: `{"token": "xoxp-..."}`. Then say **"set up slack agent"** again.
+
+> Note: `files:write` is NOT optional. Without it the agent silently can't post screenshots, and the agent posts screenshots frequently. If the install fails or the user can't grant `files:write`, see Path C.
+
+### Path C: enterprise with VENDSEC / app-review blocking custom installs
+
+If a custom app install gets rejected (often by a security review listing `files:write` as "High Risk") AND no Path A token exists:
+
+- The gateway-mediated routes some orgs offer (e.g. `sq agent-tools slack` over kgoose) WILL let you post and read messages, but will NOT support file uploads, because the gateway doesn't surface the `files.*` endpoints. Image posting will be broken.
+- The remaining options are: (1) escalate the custom-app review to get `files:write` approved on a one-off basis, (2) get an admin to install a shared internal Slack app whose token you can borrow, or (3) accept text-only operation and disable the image-upload paths in `cmd_image`.
+
+  Until one of those resolves, stop here and tell the user that file uploads will not work in their environment.
 
 ## Step 3: Verify the token works
 
